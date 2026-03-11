@@ -370,6 +370,8 @@ def render_public_form():
 
     if "ia_data" not in st.session_state:
         st.session_state["ia_data"] = {}
+    if "em_processamento" not in st.session_state:
+        st.session_state["em_processamento"] = False
 
     REQUIRED_UPLOADS = {
         "Documento de Identidade (RG ou CNH)": "rg_cnh",
@@ -567,6 +569,10 @@ def render_public_form():
         submitted = st.form_submit_button("Extrair dados e gerar Contrato")
 
     if submitted:
+        if st.session_state["em_processamento"]:
+            st.warning("⏳ O aplicativo já está gerando seus arquivos. O botão de enviar será bloqueado nesta tela para impedir duplicação de contratos por múltiplos cliques.")
+            return
+
         missing_files = [lbl for lbl, k in REQUIRED_UPLOADS.items() if uploads.get(k) is None]
         if not nome or not cpf or not email or not pis or not celular or not rg or not logradouro or not bairro or not cidade or not numero or not cep or vt_optin is None:
             st.error("🚨 Preencha os campos obrigatórios básicos.")
@@ -577,6 +583,8 @@ def render_public_form():
         if not declaracao:
             st.error("🚨 Marque a declaração de veracidade.")
             return
+            
+        st.session_state["em_processamento"] = True
 
         # Calcula VT diário somando ida+volta se forem números
         def _to_float(val):
