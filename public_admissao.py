@@ -324,7 +324,7 @@ def enviar_documento_zapsign(arquivo_pdf_bytes, nome_arquivo, email_funcionario,
         payload = {
             "name": nome_arquivo,
             "base64_pdf": base64_pdf,
-            "sandbox": True, # Ambiente de testes obrigatório para o token atual
+            "sandbox": False, # Produção Real: Sem marca d'água e com Validade Jurídica
             "signers": [
                 {
                     "name": nome_funcionario,
