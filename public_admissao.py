@@ -126,6 +126,7 @@ REGRAS:
 8. "Estado Civil": Siga a regra documental rigorosamente:
   - Se o documento apresentado for uma "Certidão de Nascimento" (e não houver averbação de casamento), preencha "SOLTEIRO(A)".
   - Se o documento for uma "Certidão de Casamento", preencha "CASADO(A)"
+9. "Validacao Vacina Antitetanica": Verifique a Carteira de Vacinação. Se ela contiver de forma clara o nome do titular (condizente com o Nome Completo extraído dos outros documentos) E nela constar o registro claro da vacina "Antitetânica" (ou Dupla Adulto / dT), preencha estritamente com a palavra "OK". Caso contrário, descreva o problema, exemplo: "Nome do titular não identificado na carteira" ou "Falta registro da vacina Antitetânica".
 
     JSON ESPERADO:
     {
@@ -133,7 +134,7 @@ REGRAS:
       "CPF": "", "RG": "", "Orgao Emissor RG": "", "UF RG": "", "Nome da Mae": "", "Nome do Pai": "",
       "CEP": "", "Logradouro": "", "Numero Endereco": "", "Complemento": "", "Bairro": "",
       "Cidade": "", "Estado": "", "PIS": "", "CTPS Numero": "", "CTPS Serie": "", "CTPS UF": "",
-      "Titulo de Eleitor": "", "Zona": "", "Secao": "", "Reservista": ""
+      "Titulo de Eleitor": "", "Zona": "", "Secao": "", "Reservista": "", "Validacao Vacina Antitetanica": ""
     }
     """
     res = modelo.generate_content([prompt] + arquivos_ia, request_options={"timeout": 600})
@@ -374,7 +375,8 @@ def render_public_form():
         "Documento de Identidade (RG ou CNH)": "rg_cnh",
         "CPF": "cpf",
         "Comprovante de Endereço": "endereco",
-        "Certidão de Nascimento ou Casamento": "certidao"
+        "Certidão de Nascimento ou Casamento": "certidao",
+        "Carteira de Vacinação (com Antitetânica)": "vacinacao"
     }
     OPTIONAL_UPLOADS = {
         "CTPS (frente/verso ou digital)": "ctps",
@@ -437,6 +439,17 @@ def render_public_form():
         telefone = c8.text_input("Telefone Fixo")
         email = c9.text_input("E-mail *")
         pis = c10.text_input("PIS *", value=ia.get("PIS", ""), help="O número do PIS pode ser encontrado na sua CTPS digital.")
+
+        st.markdown("---")
+        st.subheader("Auditoria de Saúde (IA)")
+        validacao_vacina = ia.get("Validacao Vacina Antitetanica", "")
+        if validacao_vacina:
+            if validacao_vacina.upper() == "OK":
+                st.success("✅ **Carteira de Vacinação validada pela IA:** Nome do titular confere e dose da vacina Antitetânica (dT) identificada com sucesso.")
+            else:
+                st.error(f"⚠️ **Problema na Carteira de Vacinação detectado pela IA:** {validacao_vacina}")
+        else:
+            st.warning("⚠️ O upload da Carteira de Vacinação e a Extração de Dados com IA são obrigatórios para confirmar a vacina Antitetânica.")
 
         st.markdown("---")
         st.subheader("Formação Acadêmica")
@@ -563,6 +576,11 @@ def render_public_form():
             return
         if not declaracao:
             st.error("🚨 Marque a declaração de veracidade.")
+            return
+            
+        validacao_vacina_status = ia.get("Validacao Vacina Antitetanica", "").upper()
+        if validacao_vacina_status != "OK":
+            st.error(f"🚨 A IA de Auditoria Médico-Trabalhista bloqueou o contrato. Motivo: {ia.get('Validacao Vacina Antitetanica', 'Extração não realizada ou documento inválido')}. Por favor, anexe uma Carteira de Vacinação completa e clique em '✨ Extrair Dados com IA'.")
             return
 
         # Calcula VT diário somando ida+volta se forem números
