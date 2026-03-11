@@ -335,7 +335,7 @@ def enviar_documento_zapsign(arquivo_pdf_bytes, nome_arquivo, email_funcionario,
                     "send_automatic_whatsapp": True, # Ativa envio direto pro Whatsapp
                     "phone_country": country_code,
                     "phone_number": number,
-                    "signature_placement": "<<assinatura_funcionario>>" # Âncora no template PDF
+                    "signature_placement": "-ass1-" # Âncora no template PDF (curta para escala normal)
                 },
                 {
                     "name": "RH Vicelos",
@@ -343,7 +343,7 @@ def enviar_documento_zapsign(arquivo_pdf_bytes, nome_arquivo, email_funcionario,
                     "auth_mode": "assinaturaTela", # Assinatura simples para a empresa
                     "send_automatic_email": True,
                     "send_automatic_whatsapp": False,
-                    "signature_placement": "<<assinatura_empresa>>" # Âncora do RH
+                    "signature_placement": "-ass2-" # Âncora do RH (curta para escala normal)
                 }
             ]
         }
