@@ -6,3 +6,4 @@ google-generativeai
 gspread
 num2words
 watchdog
+PyPDF2
