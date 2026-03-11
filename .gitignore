@@ -1,0 +1,23 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Streamlit secrets and credentials
+.streamlit/secrets.toml
+client_secret.json
+token.json
+credentials.json
+
+# Logs and temporary files
+*.log
+.DS_Store
+/tmp/
+test_*.pdf
