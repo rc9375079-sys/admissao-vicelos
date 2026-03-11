@@ -447,9 +447,9 @@ def render_public_form():
             if validacao_vacina.upper() == "OK":
                 st.success("✅ **Carteira de Vacinação validada pela IA:** Nome do titular confere e dose da vacina Antitetânica (dT) identificada com sucesso.")
             else:
-                st.error(f"⚠️ **Problema na Carteira de Vacinação detectado pela IA:** {validacao_vacina}")
+                st.warning(f"⚠️ **Observação na Carteira de Vacinação detectada pela IA:** {validacao_vacina}. O documento será enviado para análise no RH.")
         else:
-            st.warning("⚠️ O upload da Carteira de Vacinação e a Extração de Dados com IA são obrigatórios para confirmar a vacina Antitetânica.")
+            st.info("ℹ️ O upload da Carteira de Vacinação será exigido no fim do formulário. A validação das vacinas obrigatórias será feita manualmente pelo RH caso a foto esteja ilegível.")
 
         st.markdown("---")
         st.subheader("Formação Acadêmica")
@@ -576,11 +576,6 @@ def render_public_form():
             return
         if not declaracao:
             st.error("🚨 Marque a declaração de veracidade.")
-            return
-            
-        validacao_vacina_status = ia.get("Validacao Vacina Antitetanica", "").upper()
-        if validacao_vacina_status != "OK":
-            st.error(f"🚨 A IA de Auditoria Médico-Trabalhista bloqueou o contrato. Motivo: {ia.get('Validacao Vacina Antitetanica', 'Extração não realizada ou documento inválido')}. Por favor, anexe uma Carteira de Vacinação completa e clique em '✨ Extrair Dados com IA'.")
             return
 
         # Calcula VT diário somando ida+volta se forem números
