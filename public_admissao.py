@@ -24,7 +24,7 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 import base64
-from db_client import save_admission_record
+# from db_client import save_admission_record # Desativado para produção no Cloud
 
 # ------------------------------------------------------------
 # Config
@@ -691,16 +691,16 @@ def render_public_form():
 
         with st.spinner("Gerando kit no Drive e preenchendo planilha..."):
             link_pasta, pasta_id = gerar_kit_admissional(dados_finais)
-
-        with st.spinner("Persistindo cadastro no Postgres..."):
-            try:
-                funcionario_id = save_admission_record(dados_finais)
-                if funcionario_id:
-                    st.success(f"Registro salvo no banco (funcionário id: {funcionario_id}).")
-                else:
-                    st.warning("Não consegui salvar no banco: Nome ou CPF ausentes.")
-            except Exception as e:
-                st.warning(f"Falha ao salvar no Postgres: {e}")
+            # Tentativa de persistência no DB (Desativado na versão Cloud por enquanto)
+            # try:
+            #     with st.spinner("Persistindo cadastro no Postgres..."):
+            #         funcionario_id = save_admission_record(dados_finais)
+            #         if funcionario_id:
+            #             st.success(f"✅ Cadastro persistido no banco de dados!")
+            #         else:
+            #             st.warning("⚠️ O cadastro não pôde ser salvo no banco de dados.")
+            # except Exception as e:
+            #     st.error(f"⚠️ Falha ao salvar no Postgres: {e}")
 
         with st.spinner("Exportando e mesclando PDFs para assinatura unificada..."):
             pdfs = exportar_pdfs_da_pasta(pasta_id)
@@ -741,21 +741,21 @@ def render_public_form():
             salvar_uploads_na_pasta(pasta_id, uploads)
 
         # --- INTEGRAÇÃO ERP: Salvar Funcionario no motor financeiro centralização ---
-        with st.spinner("Sincronizando funcionário com o ERP Financeiro..."):
-            try:
-                import requests
-                erp_payload = {
-                    "nome": nome,
-                    "cpf_cnpj": cpf.replace(".", "").replace("-", "").strip(),
-                    "tipo": "funcionario"
-                }
-                res = requests.post("http://localhost:8000/entidades", json=erp_payload, timeout=5)
-                if res.status_code == 201:
-                    st.success("✅ Funcionário salvo e sincronizado na base do ERP (PostgreSQL)!")
-                else:
-                    st.warning(f"⚠️ Planilha gerada, mas houve um aviso no ERP: {res.text}")
-            except Exception as e:
-                st.error(f"⚠️ O funcionário não foi sincronizado com o ERP porque o Backend não está rodando no terminal. Erro: {e}")
+        # with st.spinner("Sincronizando funcionário com o ERP Financeiro..."):
+        #     try:
+        #         import requests
+        #         erp_payload = {
+        #             "nome": nome,
+        #             "cpf_cnpj": cpf.replace(".", "").replace("-", "").strip(),
+        #             "tipo": "funcionario"
+        #         }
+        #         res = requests.post("http://localhost:8000/entidades", json=erp_payload, timeout=5)
+        #         if res.status_code == 201:
+        #             st.success("✅ Funcionário salvo e sincronizado na base do ERP (PostgreSQL)!")
+        #         else:
+        #             st.warning(f"⚠️ Planilha gerada, mas houve um aviso no ERP: {res.text}")
+        #     except Exception as e:
+        #         st.error(f"⚠️ O funcionário não foi sincronizado com o ERP porque o Backend não está rodando no terminal. Erro: {e}")
 
         st.success("🎉 Processo concluído! Seus dados foram enviados para criação do contrato, aguarde o link para assinatura no seu Whatsapp.")
 
