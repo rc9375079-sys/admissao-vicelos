@@ -24,6 +24,7 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 import base64
+from db_client import save_admission_record
 
 # ------------------------------------------------------------
 # Config
@@ -41,7 +42,7 @@ if not ZAPSIGN_TOKEN:
         ZAPSIGN_TOKEN = st.secrets.get("ZAPSIGN_TOKEN", "")
     except Exception:
         pass
-DATA_INICIO_PADRAO = os.getenv("DATA_INICIO_PADRAO", datetime.now().strftime('%d/%m/%Y'))
+DATA_INICIO_PADRAO = os.getenv("DATA_INICIO_PADRAO", "18/03/2026")
 
 ID_PASTA_RAIZ = "1_w4HGrBnylar-vkiQTDT6ozW8KiGITZs"
 ID_PLANILHA = "1-VH1zGyTeEfJnvBhnq6ZlkyGF-G--FKXTwGHfrCvfRE"
@@ -80,19 +81,42 @@ def conectar_google():
             f.write(st.secrets["GOOGLE_CLIENT_SECRET"])
 
     creds = None
+    
+    # Prioridade 1: Service Account (Ideal para Nuvem/Streamlit Cloud)
+    if "GOOGLE_SERVICE_ACCOUNT" in st.secrets:
+        from google.oauth2 import service_account
+        info = json.loads(st.secrets["GOOGLE_SERVICE_ACCOUNT"])
+        creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+        # Service accounts não precisam de refresh manual como as credenciais de usuário
+        gc = gspread.authorize(creds)
+        st.write("✅ Conectado via Service Account (Nuvem)")
+        return build('drive', 'v3', credentials=creds), build('docs', 'v1', credentials=creds), gc
+
+    # Prioridade 2: Token de Usuário (Ideal para desenvolvimento local)
     if os.path.exists(token_pickle):
         creds = Credentials.from_authorized_user_file(token_pickle, scopes)
+        
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            from google.auth import exceptions as google_exceptions
+            try:
+                creds.refresh(Request())
+            except google_exceptions.RefreshError:
+                if os.path.exists(token_pickle):
+                    os.remove(token_pickle)
+                creds = None
+        
+        if not creds or not creds.valid:
+            # Se chegarmos aqui no Cloud sem Service Account, vai travar no run_local_server
+            if not os.path.exists(client_secret_json):
+                 st.error("Erro: client_secret.json não encontrado para reautenticação manual.")
+                 st.stop()
             flow = InstalledAppFlow.from_client_secrets_file(client_secret_json, scopes)
             creds = flow.run_local_server(port=0)
+            
         with open(token_pickle, 'w') as token:
             token.write(creds.to_json())
             
-    # O gspread autentica com o service_account separado (conforme código anterior vindo do app.py, se existir)
-    # se não, mantemos original. O erro foi no client_secret.
     gc = gspread.authorize(creds)
     return build('drive', 'v3', credentials=creds), build('docs', 'v1', credentials=creds), gc
 
@@ -325,7 +349,7 @@ def enviar_documento_zapsign(arquivo_pdf_bytes, nome_arquivo, email_funcionario,
         payload = {
             "name": nome_arquivo,
             "base64_pdf": base64_pdf,
-            "sandbox": True, # Ativado temporariamente para validação de âncoras/escala sem custo real
+            "sandbox": True, # Ativado sandbox para testes
             "signers": [
                 {
                     "name": nome_funcionario,
@@ -668,6 +692,16 @@ def render_public_form():
         with st.spinner("Gerando kit no Drive e preenchendo planilha..."):
             link_pasta, pasta_id = gerar_kit_admissional(dados_finais)
 
+        with st.spinner("Persistindo cadastro no Postgres..."):
+            try:
+                funcionario_id = save_admission_record(dados_finais)
+                if funcionario_id:
+                    st.success(f"Registro salvo no banco (funcionário id: {funcionario_id}).")
+                else:
+                    st.warning("Não consegui salvar no banco: Nome ou CPF ausentes.")
+            except Exception as e:
+                st.warning(f"Falha ao salvar no Postgres: {e}")
+
         with st.spinner("Exportando e mesclando PDFs para assinatura unificada..."):
             pdfs = exportar_pdfs_da_pasta(pasta_id)
             
@@ -705,6 +739,23 @@ def render_public_form():
 
         with st.spinner("Salvando uploads originais no Drive..."):
             salvar_uploads_na_pasta(pasta_id, uploads)
+
+        # --- INTEGRAÇÃO ERP: Salvar Funcionario no motor financeiro centralização ---
+        with st.spinner("Sincronizando funcionário com o ERP Financeiro..."):
+            try:
+                import requests
+                erp_payload = {
+                    "nome": nome,
+                    "cpf_cnpj": cpf.replace(".", "").replace("-", "").strip(),
+                    "tipo": "funcionario"
+                }
+                res = requests.post("http://localhost:8000/entidades", json=erp_payload, timeout=5)
+                if res.status_code == 201:
+                    st.success("✅ Funcionário salvo e sincronizado na base do ERP (PostgreSQL)!")
+                else:
+                    st.warning(f"⚠️ Planilha gerada, mas houve um aviso no ERP: {res.text}")
+            except Exception as e:
+                st.error(f"⚠️ O funcionário não foi sincronizado com o ERP porque o Backend não está rodando no terminal. Erro: {e}")
 
         st.success("🎉 Processo concluído! Seus dados foram enviados para criação do contrato, aguarde o link para assinatura no seu Whatsapp.")
 
