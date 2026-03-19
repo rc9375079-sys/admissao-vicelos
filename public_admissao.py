@@ -2,10 +2,8 @@
 Formulário público de admissão (apenas o fluxo do candidato).
 - Gera pasta e documentos no Drive a partir dos modelos
 - Preenche a planilha Base_de_Dados_Funcionarios
-- Exporta PDFs e entrega ZIP para upload manual ao D4Sign
 Variáveis lidas de env:
   GEMINI_API_KEY (opcional, não usada aqui)
-  D4SIGN_TOKEN, D4SIGN_CRYPT, D4SIGN_COFRE (usadas só se quiser automatizar depois)
 """
 import os
 import io
@@ -42,7 +40,7 @@ if not ZAPSIGN_TOKEN:
         ZAPSIGN_TOKEN = st.secrets.get("ZAPSIGN_TOKEN", "")
     except Exception:
         pass
-DATA_INICIO_PADRAO = os.getenv("DATA_INICIO_PADRAO", "18/03/2026")
+DATA_INICIO_PADRAO = os.getenv("DATA_INICIO_PADRAO", "23/03/2026")
 
 ID_PASTA_RAIZ = "1_w4HGrBnylar-vkiQTDT6ozW8KiGITZs"
 ID_PLANILHA = "1-VH1zGyTeEfJnvBhnq6ZlkyGF-G--FKXTwGHfrCvfRE"
@@ -314,13 +312,7 @@ def salvar_uploads_na_pasta(folder_id: str, uploads: dict):
         drive_service.files().create(body={'name': file.name, 'parents': [folder_id]}, media_body=media_body, fields='id').execute()
 
 
-def preparar_pacote_para_d4sign(pdfs):
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for nome, conteudo in pdfs:
-            zf.writestr(nome, conteudo)
-    buf.seek(0)
-    return buf.getvalue()
+
 
 def enviar_documento_zapsign(arquivo_pdf_bytes, nome_arquivo, email_funcionario, cpf_funcionario, celular_funcionario, nome_funcionario):
     """
@@ -353,7 +345,7 @@ def enviar_documento_zapsign(arquivo_pdf_bytes, nome_arquivo, email_funcionario,
         payload = {
             "name": nome_arquivo,
             "base64_pdf": base64_pdf,
-            "sandbox": True, # Ativado sandbox para testes
+            "sandbox": False, # Produção
             "signers": [
                 {
                     "name": nome_funcionario,
@@ -709,11 +701,7 @@ def render_public_form():
         with st.spinner("Exportando e mesclando PDFs para assinatura unificada..."):
             pdfs = exportar_pdfs_da_pasta(pasta_id)
             
-            # Novo fluxo: envia direto pro D4Sign em vez de apenas baixar ZIP
-            # Mantemos a geração do ZIP como backup local do RH
-            zip_bytes = preparar_pacote_para_d4sign(pdfs)
-            
-            # --- Mesclar PDFs em um único arquivo para economizar créditos do D4Sign ---
+            # --- Mesclar PDFs em um único arquivo para assinatura unificada ---
             import io
             from PyPDF2 import PdfMerger
             

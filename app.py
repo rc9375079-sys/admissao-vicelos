@@ -4,6 +4,7 @@ import gspread
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
+from google.auth import exceptions as google_exceptions
 from googleapiclient.discovery import build
 from num2words import num2words
 from datetime import datetime, timedelta, date
@@ -14,10 +15,9 @@ import io
 import pandas as pd
 import zipfile
 from PyPDF2 import PdfReader, PdfWriter
+from db_client import save_admission_record
 
-# --- NOVAS BIBLIOTECAS PARA A D4SIGN ---
-import requests
-import base64
+
 
 # ==========================================
 # 1. CONFIGURAÇÕES INICIAIS E VARIÁVEIS DE SESSÃO
@@ -32,11 +32,7 @@ if 'df_lote' not in st.session_state: st.session_state.df_lote = None
 
 API_KEY_GEMINI = os.getenv("GEMINI_API_KEY", "")
 
-# --- CONFIGURAÇÕES D4SIGN ---
-D4SIGN_TOKEN = os.getenv("D4SIGN_TOKEN", "COLOQUE_SEU_TOKEN_AQUI")
-D4SIGN_CRYPT = os.getenv("D4SIGN_CRYPT", "COLOQUE_SUA_CRYPT_KEY_AQUI")
-D4SIGN_COFRE = os.getenv("D4SIGN_COFRE", "COLOQUE_O_ID_DO_COFRE_AQUI")
-D4SIGN_BASE_URL = "https://sandbox.d4sign.com.br/api/v1" # Ambiente de Testes Sandbox
+API_KEY_GEMINI = os.getenv("GEMINI_API_KEY", "")
 
 ID_PASTA_RAIZ = "1_w4HGrBnylar-vkiQTDT6ozW8KiGITZs" 
 ID_PLANILHA = "1-VH1zGyTeEfJnvBhnq6ZlkyGF-G--FKXTwGHfrCvfRE" 
@@ -53,18 +49,7 @@ MODELOS_ADMISSAO = {
 
 FAIXAS_INSS = [(1518.00, 0.075), (2793.88, 0.09), (4190.83, 0.12), (8157.41, 0.14)]
 
-# ==========================================================
-# 2. INTEGRAÇÃO D4SIGN (NOVO MÓDULO)
-# ==========================================================
-# Fluxo temporário: geração local de PDFs para envio manual ao D4Sign.
-def preparar_pacote_para_d4sign(pdfs: list[tuple[str, bytes]]):
-    """Retorna bytes de um ZIP com todos os PDFs para upload manual no D4Sign."""
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for nome, conteudo in pdfs:
-            zf.writestr(nome, conteudo)
-    buf.seek(0)
-    return buf.getvalue()
+
 
 def render_public_form():
     query_params = st.query_params
@@ -251,19 +236,11 @@ def render_public_form():
                 with st.spinner("Gerando kit no Drive e preenchendo planilha..."):
                     link_pasta, pasta_id = gerar_kit_admissional(dados_finais)
 
-                with st.spinner("Exportando PDFs para envio ao D4Sign..."):
-                    pdfs = exportar_pdfs_da_pasta(pasta_id)
-                    zip_bytes = preparar_pacote_para_d4sign(pdfs)
-
-                st.success("Pacote pronto. Faça upload manual no D4Sign.")
-                st.markdown(f"**Pasta no Drive:** [abrir]({link_pasta})")
-                st.download_button("📥 Baixar ZIP para enviar ao D4Sign", data=zip_bytes, file_name=f"Admissao_{nome.replace(' ', '_')}.zip", mime="application/zip")
+                with st.spinner("Finalizando processo..."):
+                    st.success("Obrigado, seu processo foi concluído!")
+                    st.markdown(f"**Pasta no Drive:** [abrir]({link_pasta})")
 
         return
-
-# ==========================================================
-# FIM DO MÓDULO PÚBLICO
-# ==========================================================
 
 # ==========================================
 # 4. FUNÇÕES DE INFRAESTRUTURA E RESTO DO CÓDIGO
@@ -281,10 +258,19 @@ def conectar_google():
         creds = Credentials.from_authorized_user_file(token_pickle, SCOPES)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            try:
+                creds.refresh(Request())
+            except google_exceptions.RefreshError:
+                # Se o token expirou ou foi revogado (ex: chave deletada), removemos o arquivo para reautenticar
+                if os.path.exists(token_pickle):
+                    os.remove(token_pickle)
+                creds = None
+        
+        # Se após o refresh as credenciais ainda forem inválidas ou nulas, gera um novo fluxo
+        if not creds or not creds.valid:
             flow = InstalledAppFlow.from_client_secrets_file(client_secret_json, SCOPES)
             creds = flow.run_local_server(port=0)
+            
         with open(token_pickle, 'w') as token:
             token.write(creds.to_json())
     return build('drive', 'v3', credentials=creds), build('docs', 'v1', credentials=creds), gspread.authorize(creds)
@@ -467,14 +453,53 @@ def calcular_irrf_2026(bruto, desconto_inss, dependentes=0):
         return round(imposto_final, 2), faixa_str if imposto_final > 0 else "ISENTO"
     return round(imposto_bruto, 2), faixa_str
 
+def calcular_adiantamento_prop(sal_base, adm_str, fecham_str):
+    """
+    Calcula o adiantamento proporcional (40%) seguindo a lógica de mês comercial (30 dias).
+    Passo A: Valor do Dia Comercial (Salário / 30)
+    Passo B: Dias de Direito (Até o último dia do mês, limitado a 30)
+    Passo C: Salário Proporcional Bruto (Valor Dia * Dias Direito)
+    Passo D: Adiantamento (Salário Proporcional * 40%)
+    """
+    try:
+        dt_adm = datetime.strptime(adm_str, '%d/%m/%Y')
+        dt_fech = datetime.strptime(fecham_str, '%d/%m/%Y')
+        
+        # Passo A: Valor do Dia Comercial
+        valor_dia = sal_base / 30
+        
+        # Passo B: Dias de Direito no mês de admissão
+        # Se a admissão for no mesmo mês e ano do processamento
+        import calendar
+        ultimo_dia_mes = calendar.monthrange(dt_fech.year, dt_fech.month)[1]
+        
+        if dt_adm.year == dt_fech.year and dt_adm.month == dt_fech.month:
+            dias_trabalhados = (ultimo_dia_mes - dt_adm.day) + 1
+            # Limite a 30 para seguir o padrão comercial
+            if dias_trabalhados > 30: dias_trabalhados = 30
+            
+            # Passo C: Salário Proporcional Bruto
+            salario_prop = valor_dia * dias_trabalhados
+            
+            # Passo D: O Adiantamento (40%)
+            return round(salario_prop * 0.40, 2)
+        
+        # Se for funcionário antigo (admitido em meses anteriores)
+        return round(sal_base * 0.40, 2)
+    except Exception:
+        return round(sal_base * 0.40, 2)
+
 def gerar_holerite_dinamico(dados):
     drive, docs, _ = conectar_google()
     salario_integral = float(dados['salario_base'].replace('.','').replace(',','.'))
     tipo_processamento = dados.get('tipo_processamento', 'Fechamento Mensal')
-    
+
     if tipo_processamento == "Adiantamento Quinzenal (Dia 20)":
-        bruto = salario_integral * 0.40; liquido = bruto; total_desc = 0.0; fgts = 0.0; inss = 0.0; faixa_irrf = ""
-        rubricas = [["001", "ADIANTAMENTO QUINZENAL", "40.00", formatar_moeda(bruto), ""]]
+        bruto = calcular_adiantamento_prop(salario_integral, dados['admissao'], dados['data_fechamento'])
+        liquido = bruto; total_desc = 0.0; fgts = 0.0; inss = 0.0; faixa_irrf = ""
+        # Ajustamos o texto da rubrica se for proporcional
+        fator_texto = f"{ (bruto / salario_integral * 100):.2f}" if bruto < (salario_integral * 0.4) else "40.00"
+        rubricas = [["001", "ADIANTAMENTO QUINZENAL", fator_texto, formatar_moeda(bruto), ""]]
     else:
         try:
             dt_admissao = datetime.strptime(dados['admissao'], '%d/%m/%Y')
@@ -516,7 +541,7 @@ def gerar_holerite_dinamico(dados):
         vt = min(custo_total_vt, limite_6_pct) if custo_total_vt > 0 else limite_6_pct
         
         # 6. Outros Descontos
-        adiantamento = salario_integral * 0.40 if dados.get('pagar_adiantamento', False) else 0.0
+        adiantamento = calcular_adiantamento_prop(salario_integral, dados['admissao'], dados['data_fechamento']) if dados.get('pagar_adiantamento', False) else 0.0
         
         if dados.get('descontar_cesta', False):
             desc_cesta = round((24.25 / 30) * dias_trabalhados, 2)
@@ -570,11 +595,101 @@ def gerar_holerite_dinamico(dados):
     return f"https://docs.google.com/document/d/{copia.get('id')}/edit", liquido
 
 def gerar_excel_banco_inter(lista_pagamentos, total_folha):
+    import openpyxl
+    from openpyxl.styles import NamedStyle
+    
+    template_path = "/Users/renancarvalho/Downloads/Template_Folha_de_Pagamento.xlsx"
+    total_real = round(sum(p['Valor'] for p in lista_pagamentos), 2)
+    
+    # Tentamos carregar o template oficial para garantir 100% de compatibilidade
+    if os.path.exists(template_path):
+        try:
+            wb = openpyxl.load_workbook(template_path)
+            
+            # 1. Aba Pagador
+            ws_p = wb['Pagador']
+            # De acordo com o template e o erro, os dados devem estar na linha 2
+            ws_p['A2'] = 'VICELOS ENGENHARIA E CONSTRUÇÃO LTDA.'
+            ws_p['B2'] = '37742513000188'
+            ws_p['C2'] = '69655910'
+            ws_p['D2'] = total_real
+            # Forçamos o formato numérico do template se necessário, mas o WB já deve ter
+            ws_p['D2'].number_format = '"R$"\ #,##0.00'
+            
+            # 2. Aba Beneficiarios
+            ws_b = wb['Beneficiarios']
+            # Limpamos dados antigos se houver (o template costuma vir limpo da linha 2 em diante)
+            for row in range(2, ws_b.max_row + 1):
+                for col in range(1, 7):
+                    ws_b.cell(row=row, column=col).value = None
+            
+            for i, p in enumerate(lista_pagamentos):
+                row = i + 2
+                cpf_limpo = str(p['CPF']).replace('.', '').replace('-', '').strip()
+                # Preservamos o hífen na conta, pois o banco pode exigir o dígito separado
+                conta_original = str(p['Conta']).strip()
+                conta_limpa = conta_original.replace('.', '')
+                
+                dt_debito = datetime.strptime(p['Data Debito'], "%d/%m/%Y")
+                dt_pagto = datetime.strptime(p['Data Pagamento'], "%d/%m/%Y")
+                
+                ws_b.cell(row=row, column=1, value=str(p['Nome']).strip())
+                ws_b.cell(row=row, column=2, value=cpf_limpo)
+                ws_b.cell(row=row, column=3, value=conta_limpa)
+                ws_b.cell(row=row, column=4, value=float(p['Valor']))
+                ws_b.cell(row=row, column=5, value=dt_debito)
+                ws_b.cell(row=row, column=6, value=dt_pagto)
+                
+                # Aplicamos formatos idênticos ao template
+                ws_b.cell(row=row, column=2).number_format = '@' # CPF Texto
+                ws_b.cell(row=row, column=3).number_format = '@' # Conta Texto
+                ws_b.cell(row=row, column=4).number_format = '"R$"\ #,##0.00'
+                ws_b.cell(row=row, column=5).number_format = 'dd/mm/yyyy'
+                ws_b.cell(row=row, column=6).number_format = 'dd/mm/yyyy'
+
+            output = io.BytesIO()
+            wb.save(output)
+            return output.getvalue()
+        except Exception as e:
+            st.error(f"Erro ao usar template: {e}. Usando gerador fallback...")
+
+    # FALLBACK: Se o template não existir, usamos o xlsxwriter (tentando ser o mais fiel possível)
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        pd.DataFrame([['1- Não altere o tipo das celulas no template.'],['2- Comece a inserir os registros na primeira linha abaixo do cabeçalho.'],['3- Não deixe linhas em branco entre os registros.'],['4- Preencha todos os valores, não deixe celulas em branco.'],['5- Não coloque letras ou simbolos especiais nos valores.'],['6- Utilize 2 casas decimais nos valores, use uma vírgula para separar a parte inteira da decimal.'],['7- A data Debito não deve ser anterior ao dia atual e a data Credito não deve ser anterior a data Debito.'],['8- A data Credito não pode ser posterior a 1 ano a partir do dia atual.'],['9- Use o formato dd/mm/aaaa para data. EX: 05/08/2022'],['10- Não adicione novas colunas.'],['11- Não altere, adicione ou remova planilhas deste arquivo.']]).to_excel(writer, sheet_name='Instruções', index=False, header=False)
-        pd.DataFrame([['Empresa', 'CNPJ', 'Conta Corrente', 'Valor Total da Folha de Pagamento'],['VICELOS ENGENHARIA E CONSTRUÇÃO LTDA.', '37742513000188', '69655910', f"{total_folha:.2f}".replace('.', ',')]]).to_excel(writer, sheet_name='Pagador', index=False, header=False)
-        pd.DataFrame([[p['Nome'], str(p['CPF']).replace('.','').replace('-','').strip(), p['Conta'], f"{p['Valor']:.2f}".replace('.',','), p['Data Debito'], p['Data Pagamento']] for p in lista_pagamentos], columns=['Nome', 'CPF', 'Conta Corrente - Receb', 'Valor', 'Data do Débito', 'Data do Pagamento']).to_excel(writer, sheet_name='Beneficiários', index=False)
+        pd.DataFrame([['1- Não altere...'], ['...']]).to_excel(writer, sheet_name='Instruções', index=False, header=False)
+        
+        df_pagador = pd.DataFrame([
+            ['VICELOS ENGENHARIA E CONSTRUÇÃO LTDA.', '37742513000188', '69655910', total_real]
+        ], columns=['Empresa', 'CNPJ', 'Conta Corrente', 'Valor Total da Folha de Pagamento'])
+        df_pagador.to_excel(writer, sheet_name='Pagador', index=False)
+        
+        dados_b = []
+        for p in lista_pagamentos:
+            dados_b.append([
+                str(p['Nome']).strip(),
+                str(p['CPF']).replace('.', '').replace('-', '').strip(),
+                str(p['Conta']).replace('.', '').replace('-', '').strip(),
+                float(p['Valor']),
+                datetime.strptime(p['Data Debito'], "%d/%m/%Y"),
+                datetime.strptime(p['Data Pagamento'], "%d/%m/%Y")
+            ])
+        df_b = pd.DataFrame(dados_b, columns=['Nome','CPF','Conta Corrente - Receb','Valor','Data do Débito','Data do Pagamento'])
+        df_b.to_excel(writer, sheet_name='Beneficiarios', index=False)
+        
+        workbook = writer.book
+        fmt_val = workbook.add_format({'num_format': '"R$"\ #,##0.00'})
+        fmt_txt = workbook.add_format({'num_format': '@'})
+        fmt_dat = workbook.add_format({'num_format': 'dd/mm/yyyy'})
+        
+        ws_b = writer.sheets['Beneficiarios']
+        ws_b.set_column('B:C', None, fmt_txt)
+        ws_b.set_column('D:D', None, fmt_val)
+        ws_b.set_column('E:F', None, fmt_dat)
+        
+        ws_p = writer.sheets['Pagador']
+        ws_p.set_column('B:C', None, fmt_txt)
+        ws_p.set_column('D:D', None, fmt_val)
+
     return output.getvalue()
 
 def buscar_funcionarios():
@@ -587,10 +702,11 @@ def buscar_funcionarios():
             lista.append({
                 'nome': linha[2], 'cpf': linha[12], 'admissao': linha[54], 
                 'cargo': linha[55], 'cbo': linha[56], 'salario': linha[57], 
+                'banco': linha[46] if len(linha) > 46 else "",
                 'conta': linha[48], 'oposicao': linha[61], 'obra': linha[64],
                 'vt_diario': linha[52] if len(linha) > 52 else "0,00",
-                'va_mensal': linha[58] if len(linha) > 58 else "0,00", # COLUNA DO VA (ex: 485,00)
-                'vr_mensal': linha[59] if len(linha) > 59 else "0,00"  # COLUNA DO VR (ex: 120,00)
+                'va_mensal': linha[58] if len(linha) > 58 else "0,00",
+                'vr_mensal': linha[59] if len(linha) > 59 else "0,00"
             })
     return lista
 
@@ -729,13 +845,13 @@ def classificar_e_splitar_pdf(pdf_file):
     3. Retorne uma matriz exata de páginas (ex: [4, 5]).
     
     Para cada documento encontrado, retorne:
-    1. O nome do funcionário.
-    2. O tipo do documento (ex: Contrato de Trabalho, Ficha de EPI, ASO, Documentos Pessoais, Certificado NR 35, Avaliação NR 35, Termo LGPD, etc).
+    1. O tipo de documento (ex: NR01 , NR06 , NR12 , NR18 ,NR35, ASO)
+    2. O nome do funcionário.
     3. A lista de páginas.
     
     Retorne no formato JSON:
     [
-      {"funcionario": "NOME DO FUNCIONARIO", "tipo": "TIPO DO DOCUMENTO", "paginas": [1, 2]}
+      {""tipo": "TIPO DO DOCUMENTO", "funcionario": "NOME DO FUNCIONARIO", "paginas": [1, 2]}
     ]
     """
     response = model.generate_content([prompt, arquivo_gemini], request_options={"timeout": 600})
@@ -762,74 +878,48 @@ def classificar_e_splitar_pdf(pdf_file):
             if paginas_adicionadas:
                 output_pdf = io.BytesIO()
                 writer.write(output_pdf)
-                
-                tipo_formatado = doc['tipo'].replace(' ', '_').upper()
-                nome_formatado = doc['funcionario'].replace(' ', '_').upper()
-                paginas_formatadas = "_".join(paginas_adicionadas) 
-                
-                nome_arquivo = f"{tipo_formatado}_{nome_formatado}_{paginas_formatadas}.pdf"
-                
-                zip_file.writestr(nome_arquivo, output_pdf.getvalue())
-            
-    os.remove("temp_scan.pdf")
-    return zip_buffer.getvalue()
-
-# ==========================================
-# 5. D4SIGN
-# ==========================================
-
-D4SIGN_TOKEN = "SEU_TOKEN_AQUI"
-D4SIGN_CRYPT = "SUA_CRYPT_KEY_AQUI"
-ID_COFRE = "SEU_ID_DO_COFRE_AQUI"
-BASE_URL_D4 = "https://app.d4sign.com.br/api/v1"
-
-def enviar_documento_d4sign(arquivo_pdf_bytes, nome_arquivo, email_funcionario):
-    """
-    Envia um arquivo em bytes para o D4Sign e dispara para o e-mail do funcionário.
-    """
-    # 1. Codificar o arquivo em Base64 para envio
-    arquivo_b64 = base64.b64encode(arquivo_pdf_bytes).decode('utf-8')
-    
-    # 2. Upload para o Cofre do D4Sign
-    url_upload = f"{BASE_URL_D4}/documents/{ID_COFRE}/upload?tokenAPI={D4SIGN_TOKEN}&cryptKey={D4SIGN_CRYPT}"
-    payload_upload = {
-        "base64_binary_file": arquivo_b64,
-        "mime_type": "application/pdf",
-        "name": nome_arquivo
-    }
-    
-    req_up = requests.post(url_upload, json=payload_upload)
-    uuid_documento = req_up.json()[0]['uuid'] # Pega o ID único do documento gerado
-    
-    # 3. Adicionar o funcionário como signatário
-    url_maker = f"{BASE_URL_D4}/documents/{uuid_documento}/makemaker?tokenAPI={D4SIGN_TOKEN}&cryptKey={D4SIGN_CRYPT}"
-    payload_maker = {
-        "signers": [
-            {
-                "email": email_funcionario,
-                "act": "1", # O código 1 significa que ele precisa assinar
-                "foreign": "0",
-                "tipo_assinatura": "1" # Assinatura padrão na tela
-            }
-        ]
-    }
-    requests.post(url_maker, json=payload_maker)
-    
-    # 4. Enviar para a caixa de e-mail dele
-    url_send = f"{BASE_URL_D4}/documents/{uuid_documento}/sendtosigner?tokenAPI={D4SIGN_TOKEN}&cryptKey={D4SIGN_CRYPT}"
-    payload_send = {
-        "message": "Olá! Bem-vindo à Vicelos. Por favor, assine seu Kit Admissional.",
-        "skip_email": "0"
-    }
-    requests.post(url_send, json=payload_send)
-    
-    return uuid_documento # Guardamos isso para checar se ele já assinou depois
 
 # ==========================================
 # 6. FRONT-END
 # ==========================================
 st.sidebar.title("🏗️ Vicelos System")
-menu = st.sidebar.radio("Navegue para:", ["👥 Admissão Inteligente", "💰 Folha de Pagamento", "📂 Organizador de Scans", "⚖️ Simulador de Desligamento"])
+
+# Diagnóstico rápido de conexão com Postgres
+with st.sidebar.expander("🔌 Diagnóstico"):
+    from db_client import health_check
+    if st.button("Testar Postgres"):
+        ok, msg = health_check()
+        if ok:
+            st.success("Conexão OK")
+        else:
+            st.error(f"Falhou: {msg}")
+    st.caption("Use DB_HOST/PORT/NAME/USER/PASSWORD em env se necessário.")
+
+menu = st.sidebar.radio("Navegue para:", ["👥 Admissão Inteligente", "💰 Folha de Pagamento", "📂 Organizador de Scans", "⚖️ Simulador de Desligamento", "🏦 Conciliação Bancária", "🧾 Gestão Fiscal (NFS-e)"])
+st.sidebar.markdown("---")
+st.sidebar.write("🗄️ Ferramentas")
+abrir_sql = st.sidebar.checkbox("Abrir painel SQL rápido")
+
+if abrir_sql:
+    st.markdown("### 🗄️ Painel SQL (leitura)")
+    st.caption("Roda SELECTs direto no Postgres local. Somente leitura.")
+    default_query = "SELECT id, data_competencia, descricao, numero_documento FROM lancamentos ORDER BY criado_em DESC LIMIT 5;"
+    sql_text = st.text_area("SQL", value=default_query, height=120)
+    if st.button("Executar SQL"):
+        try:
+            import psycopg2
+            import pandas as pd
+            conn = psycopg2.connect(
+                host=os.getenv("DB_HOST", "localhost"),
+                port=os.getenv("DB_PORT", "5432"),
+                dbname=os.getenv("DB_NAME", "vicelos_erp"),
+                user=os.getenv("DB_USER", "vicelos"),
+                password=os.getenv("DB_PASSWORD", "vicelos"),
+            )
+            df = pd.read_sql(sql_text, conn)
+            st.dataframe(df)
+        except Exception as e:
+            st.error(f"Erro ao executar SQL: {e}")
 
 if menu == "👥 Admissão Inteligente":
     st.title("🏗️ Vicelos - Admissão Inteligente")
@@ -911,7 +1001,7 @@ elif menu == "💰 Folha de Pagamento":
                 with st.form("f_ind"):
                     col_t, col_f = st.columns(2)
                     tipo_p = col_t.radio("Tipo", ["Fechamento Mensal", "Adiantamento Quinzenal (Dia 20)"])
-                    data_f = col_f.text_input("Fechamento", "28/02/2026")
+                    data_f = col_f.date_input("Fechamento", value=date(2026, 2, 28), format="DD/MM/YYYY")
                     c1, c2, c3 = st.columns(3)
                     he = c1.number_input("HE 60%", 0.0); he100 = c2.number_input("HE 100%", 0.0); atraso = c3.number_input("Atrasos", 0.0)
                     
@@ -919,15 +1009,17 @@ elif menu == "💰 Folha de Pagamento":
                     falta = c4.number_input("Faltas", 0)
                     dsr = c5.number_input("DSR Perdido", 0)
                     dias_vt = c6.number_input("Dias Úteis VT", value=22, min_value=0, max_value=31)
-                    p_vale = c7.checkbox("Desc. Adiant.?", True)
-                    d_cesta = c8.checkbox("Desc. VA?", True)
+                    
+                    # Se for adiantamento, não faz sentido marcar "Pagar Adiantamento" (ele JÁ É o adiantamento)
+                    p_vale = c7.checkbox("Pagar Adiant.?", value=True, disabled=(tipo_p == "Adiantamento Quinzenal (Dia 20)"))
+                    d_cesta = c8.checkbox("Desc. VA?", value=True)
                     
                     if st.form_submit_button("Gerar"):
                         with st.spinner("Gerando..."):
                             link, _ = gerar_holerite_dinamico({
                                 **func, 
                                 'salario_base': func['salario'], 
-                                'data_fechamento': data_f, 
+                                'data_fechamento': data_f.strftime('%d/%m/%Y'), 
                                 'qtd_he': he, 
                                 'qtd_he_100': he100, 
                                 'dias_faltas': falta, 
@@ -940,36 +1032,61 @@ elif menu == "💰 Folha de Pagamento":
                             })
                             st.session_state.ultimo_holerite = link; st.rerun()
     with aba2:
-        c_t, c_d, c_p = st.columns([2, 1, 1])
+        c_t, c_d, c_p, c_f = st.columns([2, 1, 1, 1])
         t_lote = c_t.radio("Lote:", ["Fechamento Mensal", "Adiantamento Quinzenal (Dia 20)"], horizontal=True)
-        d_deb = c_d.text_input("Débito", datetime.now().strftime('%d/%m/%Y'))
-        d_pag = c_p.text_input("Crédito", datetime.now().strftime('%d/%m/%Y'))
+        d_deb = c_d.date_input("Débito", value=date.today(), format="DD/MM/YYYY")
+        d_pag = c_p.date_input("Crédito", value=date.today(), format="DD/MM/YYYY")
+        data_fechamento_lote = c_f.date_input("Fechamento", value=date(2026, 2, 28), format="DD/MM/YYYY")
+        
         if st.button("📊 Carregar Tabela"):
              df = pd.DataFrame(buscar_funcionarios())
              if not df.empty:
-                 df['Data Fechamento'] = "28/02/2026"; df['HE 60%'] = 0.0; df['HE 100%'] = 0.0; df['Faltas'] = 0; df['DSR Perdido'] = 0; df['Atrasos (Hrs)'] = 0.0; df['Dias Úteis VT'] = 22; df['Desc. Adiant.?'] = True; df['Desc. VA?'] = True
+                 df.insert(0, 'Selecionar', True)
+                 df['Data Fechamento'] = data_fechamento_lote.strftime('%d/%m/%Y')
+                 df['HE 60%'] = 0.0; df['HE 100%'] = 0.0; df['Faltas'] = 0; df['DSR Perdido'] = 0; df['Atrasos (Hrs)'] = 0.0; df['Dias Úteis VT'] = 22; 
+                 df['Desc. Adiant.?'] = False if t_lote == "Adiantamento Quinzenal (Dia 20)" else True
+                 df['Desc. VA?'] = True
              st.session_state.df_lote = df
         if st.session_state.df_lote is not None and not st.session_state.df_lote.empty:
             df_ed = st.data_editor(st.session_state.df_lote, hide_index=True)
             if st.button("🚀 Processar Geral"):
                 links = []; l_inter = []; t_folha = 0.0; bar = st.progress(0)
-                for i, row in df_ed.iterrows():
-                    link, liq = gerar_holerite_dinamico({
-                        **row, 
-                        'salario_base': row['salario'], 
-                        'data_fechamento': row['Data Fechamento'], 
-                        'qtd_he': row['HE 60%'], 
-                        'qtd_he_100': row['HE 100%'], 
-                        'dias_faltas': row['Faltas'], 
-                        'dsr_descontado': row['DSR Perdido'], 
-                        'horas_atrasos': row['Atrasos (Hrs)'], 
-                        'dias_uteis_vt': row['Dias Úteis VT'],
-                        'pagar_adiantamento': row['Desc. Adiant.?'], 
-                        'descontar_cesta': row['Desc. VA?'], 
-                        'tipo_processamento': t_lote
-                    })
-                    t_folha += liq; l_inter.append({"Nome": row['nome'], "CPF": row['cpf'], "Conta": row['conta'], "Valor": round(liq, 2), "Data Debito": d_deb, "Data Pagamento": d_pag})
-                    links.append(f"- **{row['nome']}:** [Holerite]({link})"); bar.progress((i+1)/len(df_ed))
+                df_selecionados = df_ed[df_ed['Selecionar'] == True]
+                if df_selecionados.empty:
+                    st.warning("Nenhum funcionário selecionado.")
+                else:
+                    for i, (index, row) in enumerate(df_selecionados.iterrows()):
+                        link, liq = gerar_holerite_dinamico({
+                            **row, 
+                            'salario_base': row['salario'], 
+                            'data_fechamento': row['Data Fechamento'], 
+                            'qtd_he': row['HE 60%'], 
+                            'qtd_he_100': row['HE 100%'], 
+                            'dias_faltas': row['Faltas'], 
+                            'dsr_descontado': row['DSR Perdido'], 
+                            'horas_atrasos': row['Atrasos (Hrs)'], 
+                            'dias_uteis_vt': row['Dias Úteis VT'],
+                            'pagar_adiantamento': row['Desc. Adiant.?'], 
+                            'descontar_cesta': row['Desc. VA?'], 
+                            'tipo_processamento': t_lote
+                        })
+                        t_folha += liq; l_inter.append({"Nome": row['nome'], "CPF": row['cpf'], "Conta": row['conta'], "Valor": round(liq, 2), "Data Debito": d_deb.strftime('%d/%m/%Y'), "Data Pagamento": d_pag.strftime('%d/%m/%Y')})
+                        links.append(f"- **{row['nome']}:** [Holerite]({link})"); bar.progress((i+1)/len(df_selecionados))
+                        
+                        # --- INTEGRAÇÃO ERP: POST DO HOLERITE ---
+                        import requests
+                        try:
+                            payload_folha = {
+                                "cpf_funcionario": row['cpf'].replace(".", "").replace("-", "").strip(),
+                                "competencia_texto": row['Data Fechamento'],
+                                "data_pagamento": d_pag.strftime('%Y-%m-%d'),
+                                "salario_liquido": liq
+                            }
+                            # Envia para a porta 8000 (onde o Uvicorn estará rodando em background)
+                            requests.post("http://localhost:8000/lancamentos/folha", json=payload_folha, timeout=3)
+                        except:
+                            pass # Em produção deveríamos logar.
+                        # ----------------------------------------
                 st.download_button("📥 Baixar Planilha Inter", gerar_excel_banco_inter(l_inter, t_folha), f"Folha_{datetime.now().strftime('%Y%m%d')}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                 st.markdown("\n".join(links))
 
@@ -1093,3 +1210,176 @@ elif menu == "⚖️ Simulador de Desligamento":
             
             st.error(f"**1. Pagamento PIX:** As verbas rescisórias devem cair na conta do funcionário até **{prazo_pagamento.strftime('%d/%m/%Y')}** (10 dias corridos).")
             st.error(f"**2. e-Social:** O evento S-2299 deve ser enviado no portal web em até 10 dias do desligamento (geralmente junto com o pagamento) para a emissão oficial do TRCT.")
+
+elif menu == "🏦 Conciliação Bancária":
+    st.title("🏦 Conciliação Inteligente (Banco Inter)")
+    st.info("Central do Robô Financeiro: Faça o upload do Extrato .OFX ou .CSV. O algoritmo irá varrer suas Contas a Pagar/Receber pendentes e efetivar a baixa automática no fluxo de caixa real da empresa.")
+    
+    arquivo_upload = st.file_uploader("Arraste e solte o Extrato aqui", type=["ofx", "csv", "xlsx"])
+    
+    if arquivo_upload:
+        st.write(f"📄 Arquivo pronto: `{arquivo_upload.name}`")
+        st.warning("Certifique-se que o motor do ERP (FastAPI) está ligado no terminal antes de processar.")
+        if st.button("🚀 Iniciar Motor de Conciliação"):
+            with st.spinner("Descriptografando Extrato e caçando Títulos Pendentes..."):
+                try:
+                    import requests
+                    files = {"file": (arquivo_upload.name, arquivo_upload.getvalue())}
+                    resultado = requests.post("http://localhost:8000/integracoes/inter/conciliar", files=files)
+                    
+                    if resultado.status_code == 200:
+                        dados = resultado.json()
+                        st.success(f"✅ {dados.get('message', 'Concluído!')}")
+                        
+                        col1, col2, col3 = st.columns(3)
+                        col1.metric("Linhas do Extrato", dados['analitico']['linhas_processadas'])
+                        col2.metric("Matches (Baixas)", f"✅ {dados['analitico']['baixas_automaticas']}")
+                        col3.metric("Não Conciliados", f"⚠️ {dados['analitico']['nao_conciliados']}")
+                        
+                        st.json(dados)
+                    else:
+                        st.error(f"❌ O Backend Recusou o Arquivo: {resultado.text}")
+                except Exception as e:
+                    st.error(f"❌ Erro Crítico de Comunicação. O terminal do FastAPI está ligado? Detalhe: {e}")
+
+    st.markdown("---")
+    st.markdown("#### 💳 Processamento de Faturas de Cartão")
+    st.info("Caso queira lançar as dívidas do Cartão de Crédito como Despesas na contabilidade, use o CSV da Fatura abaixo:")
+    
+    fatura_upload = st.file_uploader("Upload CSV Fatura", type=["csv"], key="fatura_upload")
+    if fatura_upload:
+        if st.button("💸 Lançar Despesas do Cartão"):
+            with st.spinner("Fragmentando Compras e criando Dívida Analítica no Contas a Pagar..."):
+                try:
+                    import requests
+                    files = {"file": (fatura_upload.name, fatura_upload.getvalue())}
+                    resultado = requests.post("http://localhost:8000/integracoes/inter/fatura", files=files)
+                    
+                    if resultado.status_code == 201:
+                        dados = resultado.json()
+                        st.success("✅ Fatura importada com Sucesso para o Motor de Partidas Dobradas!")
+                        st.metric("Total da Dívida a Pagar", f"R$ {dados['total_registrado']:.2f}")
+                        st.metric("Lançamentos de Despesa Unificados", dados['despesas_criadas'])
+                    else:
+                        st.error(f"❌ Erro do Servidor: {resultado.text}")
+                except Exception as e:
+                    st.error(f"❌ Erro Crítico do Back-end: {e}")
+
+    st.markdown("---")
+    st.subheader("📋 Títulos Pendentes (Não Conciliados)")
+    if st.button("🔄 Atualizar Lista de Pendências"):
+        try:
+            r = requests.get("http://localhost:8000/financeiro/pendencias")
+            if r.status_code == 200:
+                pendencias = r.json()
+                if pendencias:
+                    df_p = pd.DataFrame(pendencias)
+                    st.table(df_p[["tipo", "valor", "data_vencimento", "entidade", "descricao"]])
+                else:
+                    st.success("Tudo em dia! Nenhuma pendência encontrada.")
+        except:
+            st.error("Não foi possível conectar ao Backend para buscar pendências.")
+
+elif menu == "🧾 Gestão Fiscal (NFS-e)":
+    st.title("🧾 Gestão Fiscal: Importação de NFS-e")
+    st.info("Importação local de NFS-e (CSV prefeitura). O arquivo será lido e os lançamentos serão gravados direto no Postgres (R01/A01/A02/A03) com movimentação de entrada opcional.")
+    
+    csv_upload = st.file_uploader("Upload CSV NFS-e", type=["csv"])
+    if csv_upload and st.button("📡 Importar no ERP"):
+        with st.spinner("Processando CSV..."):
+            import pandas as pd
+            from decimal import Decimal
+            from db_client import import_nfse_rows
+            import re
+
+            def parse_money(txt):
+                if pd.isna(txt):
+                    return Decimal("0")
+                s = str(txt).replace(".", "").replace(",", ".")
+                try:
+                    return Decimal(s)
+                except Exception:
+                    return Decimal("0")
+
+            def parse_date(txt):
+                if pd.isna(txt) or not str(txt).strip():
+                    return None
+                for fmt in ("%d/%m/%Y", "%d/%m/%Y %H:%M:%S"):
+                    try:
+                        return datetime.strptime(str(txt).split()[0], fmt).date()
+                    except Exception:
+                        continue
+                return None
+
+            def extract_vencimento(desc: str):
+                if not desc:
+                    return None
+                m = re.search(r"VENCIMENTO\\s*(\\d{2}/\\d{2}/\\d{4})", desc.upper())
+                if m:
+                    return parse_date(m.group(1))
+                return None
+
+            def extract_valor_liquido(desc: str):
+                if not desc:
+                    return Decimal("0")
+                m = re.search(r"VALOR\\s*LIQUIDO\\s*\\.\\.\\.\\.\\.\\.\\.\\.\\.\\.\\s*R\\$\\s*([\\d.,]+)", desc.upper())
+                if m:
+                    return parse_money(m.group(1))
+                m2 = re.search(r"VALOR\\s*LIQUIDO[^\\d]*([\\d.,]+)", desc.upper())
+                if m2:
+                    return parse_money(m2.group(1))
+                return Decimal("0")
+
+            def extract_ret_tec(desc: str):
+                if not desc:
+                    return Decimal("0")
+                # priorizar valor monetário após R$
+                m = re.search(r"RETEN[ÇC][AÃ]O\\s*TECNICA[^R$]*R\\$\\s*([\\d.,]+)", desc.upper())
+                if m:
+                    return parse_money(m.group(1))
+                m2 = re.search(r"RETEN[ÇC][AÃ]O\\s*TECNICA[^\\d]*([\\d.,]+)", desc.upper())
+                if m2:
+                    return parse_money(m2.group(1))
+                return Decimal("0")
+
+            df = pd.read_csv(csv_upload, encoding="latin-1", sep=";")
+            if "Tipo de Registro" in df.columns:
+                df = df[df["Tipo de Registro"] == "2"]
+
+            rows = []
+            for _, r in df.iterrows():
+                descricao_raw = str(r.get("Discriminação dos Serviços", "")).strip()
+                vencimento = extract_vencimento(descricao_raw)
+
+                # Valor a receber preferencial
+                valor_a_receber = parse_money(r.get("Valor a Receber"))
+                valor_total_recebido = parse_money(r.get("Valor Total Recebido"))
+                valor_liquido_desc = extract_valor_liquido(descricao_raw)
+                ret_tec = extract_ret_tec(descricao_raw)
+
+                row = {
+                    "numero": str(r.get("Nº NFS-e", "")).strip(),
+                    "data_fato": parse_date(r.get("Data do Fato Gerador") or r.get("Data Hora NFE")),
+                    "descricao": descricao_raw,
+                    "tomador_nome": str(r.get("Razão Social do Tomador", "")).strip(),
+                    "tomador_cpf": str(r.get("CPF/CNPJ do Tomador", "")).replace(".", "").replace("-", "").replace("/", "").strip(),
+                    "valor_servicos": parse_money(r.get("Valor dos Serviços")),
+                    "deducoes": parse_money(r.get("Valor das Deduções")),
+                    "iss_retido": parse_money(r.get("ISS Retido")),
+                    "inss_retido": parse_money(r.get("INSS")),
+                    "valor_recebido": next(v for v in [valor_a_receber, valor_total_recebido, valor_liquido_desc] if v > 0) if any(v > 0 for v in [valor_a_receber, valor_total_recebido, valor_liquido_desc]) else Decimal("0"),
+                    "retencao_tecnica": ret_tec,
+                    "obra_codigo": str(r.get("Matrícula da Obra", "")).strip() or None,
+                    "data_pagamento": vencimento or parse_date(r.get("Data do Fato Gerador") or r.get("Data Hora NFE")),
+                }
+                rows.append(row)
+
+            if not rows:
+                st.warning("Nenhuma linha de nota encontrada (Tipo de Registro != 2).")
+            else:
+                resumo = import_nfse_rows(rows)
+                st.success(f"Lançamentos criados: {resumo['lancamentos_criados']} | Movimentações: {resumo['movimentacoes_criadas']}")
+                if resumo.get("erros"):
+                    st.warning("Ocorreram avisos/erros:")
+                    for e in resumo["erros"]:
+                        st.write(f"- {e}")

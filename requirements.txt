@@ -7,4 +7,5 @@ gspread
 num2words
 watchdog
 PyPDF2
+openpyxl
 psycopg2-binary

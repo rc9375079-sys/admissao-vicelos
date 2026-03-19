@@ -45,11 +45,8 @@ def test_ia_extraction_success(mock_processar):
     end_input = next(ti for ti in at.text_input if ti.label == "Endereço (Rua/Av) *")
     assert end_input.value == "Rua das Flores", "Endereço da IA não preencheu."
 
-@patch("public_admissao.gerar_kit_admissional")
-@patch("public_admissao.exportar_pdfs_da_pasta")
-@patch("public_admissao.preparar_pacote_para_d4sign")
 @patch("public_admissao.salvar_uploads_na_pasta")
-def test_submission_fails_without_required(mock_salvar, mock_preparar, mock_exportar, mock_gerar):
+def test_submission_fails_without_required(mock_salvar, mock_exportar, mock_gerar):
     """
     Garante que o formulário bloqueie a submissão se campos obrigatórios ou uploads estiverem faltando.
     """
