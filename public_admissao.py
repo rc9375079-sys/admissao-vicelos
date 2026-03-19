@@ -193,6 +193,8 @@ def gerar_kit_admissional(dados_finais):
         '{{CTPS_SERIE}}': dados_finais.get('CTPS Serie', dados_finais.get('ctps_serie', '')),
         '{{FUNCAO}}': dados_finais.get('cargo', ''),
         '{{SALARIO}}': dados_finais.get('salario', ''),
+        '{{ASSINATURA_FUNCIONARIO}}': '<<ass-func>>',
+        '{{ASSINATURA_RH}}': '<<ass-rh>>',
         '{{SALARIO_EXTENSO}}': sal_extenso,
         '{{DATA_INICIO}}': dados_finais.get('data_inicio', ''),
         '{{DATA_ADMISSAO}}': dados_finais.get('data_inicio', ''),  # aliases para modelos diferentes
@@ -354,20 +356,20 @@ def enviar_documento_zapsign(arquivo_pdf_bytes, nome_arquivo, email_funcionario,
                 {
                     "name": nome_funcionario,
                     "email": email_funcionario,
-                    "auth_mode": "tokenWhatsapp", # Autenticação via WhatsApp
+                    "auth_mode": "assinaturaTela-tokenWhatsapp", # Assinatura na tela + Token WhatsApp
                     "send_automatic_email": True,
-                    "send_automatic_whatsapp": True, # Ativa envio direto pro Whatsapp
+                    "send_automatic_whatsapp": True,
                     "phone_country": country_code,
                     "phone_number": number,
-                    "signature_placement": "-ass1-" # Âncora no template PDF (curta para escala normal)
+                    "signature_placement": "<<ass-func>>" # Âncora recomendada pela ZapSign
                 },
                 {
                     "name": "RH Vicelos",
                     "email": "contato@viceloseng.com.br",
-                    "auth_mode": "assinaturaTela", # Assinatura simples para a empresa
+                    "auth_mode": "assinaturaTela", # Assinatura na tela para a empresa
                     "send_automatic_email": True,
                     "send_automatic_whatsapp": False,
-                    "signature_placement": "-ass2-" # Âncora do RH (curta para escala normal)
+                    "signature_placement": "<<ass-rh>>"
                 }
             ]
         }
