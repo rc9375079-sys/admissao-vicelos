@@ -195,6 +195,8 @@ def gerar_kit_admissional(dados_finais):
         '{{SALARIO}}': dados_finais.get('salario', ''),
         '{{ASSINATURA_FUNCIONARIO}}': '<<ass-func>>',
         '{{ASSINATURA_RH}}': '<<ass-rh>>',
+        '-ass1-': '<<ass-func>>', # Caso o modelo use a tag direta
+        '-ass2-': '<<ass-rh>>',
         '{{SALARIO_EXTENSO}}': sal_extenso,
         '{{DATA_INICIO}}': dados_finais.get('data_inicio', ''),
         '{{DATA_ADMISSAO}}': dados_finais.get('data_inicio', ''),  # aliases para modelos diferentes
