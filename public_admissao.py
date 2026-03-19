@@ -40,7 +40,7 @@ if not ZAPSIGN_TOKEN:
         ZAPSIGN_TOKEN = st.secrets.get("ZAPSIGN_TOKEN", "")
     except Exception:
         pass
-DATA_INICIO_PADRAO = os.getenv("DATA_INICIO_PADRAO", "23/03/2026")
+DATA_INICIO_PADRAO = "23/03/2026"
 
 ID_PASTA_RAIZ = "1_w4HGrBnylar-vkiQTDT6ozW8KiGITZs"
 ID_PLANILHA = "1-VH1zGyTeEfJnvBhnq6ZlkyGF-G--FKXTwGHfrCvfRE"
