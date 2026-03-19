@@ -40,7 +40,7 @@ if not ZAPSIGN_TOKEN:
         ZAPSIGN_TOKEN = st.secrets.get("ZAPSIGN_TOKEN", "")
     except Exception:
         pass
-DATA_INICIO_PADRAO = "23/03/2026"
+DATA_INICIO_PADRAO_STR = "23/03/2026"
 
 ID_PASTA_RAIZ = "1_w4HGrBnylar-vkiQTDT6ozW8KiGITZs"
 ID_PLANILHA = "1-VH1zGyTeEfJnvBhnq6ZlkyGF-G--FKXTwGHfrCvfRE"
@@ -526,6 +526,17 @@ def render_public_form():
         dep1_parent = dep3.text_input("Dependente 1 Parentesco")
 
         st.markdown("---")
+        st.subheader("Data de Admissão")
+        st.caption("Escolha a data oficial de início do funcionário.")
+        # Converter string padrão para objeto date
+        try:
+            default_dt = datetime.strptime(DATA_INICIO_PADRAO_STR, '%d/%m/%Y').date()
+        except:
+            default_dt = date.today()
+        
+        dt_adm_escolhida = st.date_input("Data de Início *", value=default_dt, format="DD/MM/YYYY")
+
+        st.markdown("---")
         st.subheader("Dados Bancários")
         st.caption("Preencha apenas quando a sua conta no Banco Inter estiver aberta ou caso já possua conta.")
         b1, b2, b3 = st.columns(3)
@@ -633,7 +644,7 @@ def render_public_form():
             'cargo': cargo,
             'salario': salario_base,
             'vt_diario': vt_valor_str,
-            'data_inicio': DATA_INICIO_PADRAO,
+            'data_inicio': dt_adm_escolhida.strftime('%d/%m/%Y') if dt_adm_escolhida else DATA_INICIO_PADRAO_STR,
             'obra': '',
             'nacionalidade': nacionalidade,
             'estado_civil': estado_civil,
