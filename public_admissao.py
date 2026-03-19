@@ -71,12 +71,12 @@ def conectar_google():
     client_secret_json = os.path.join(BASE_DIR, 'client_secret.json')
     service_acc_json = os.path.join(BASE_DIR, 'service_account.json')
     
-    # Estratégia de Deploy Nuvem: Cria os arquivos JSON físicos no servidor a partir dos Secrets
-    if not os.path.exists(token_pickle) and "GOOGLE_TOKEN_JSON" in st.secrets:
+    # Estratégia de Deploy Nuvem: Garante que os arquivos JSON estejam sincronizados com os Secrets
+    if "GOOGLE_TOKEN_JSON" in st.secrets:
         with open(token_pickle, "w") as f:
             f.write(st.secrets["GOOGLE_TOKEN_JSON"])
     
-    if not os.path.exists(client_secret_json) and "GOOGLE_CLIENT_SECRET" in st.secrets:
+    if "GOOGLE_CLIENT_SECRET" in st.secrets:
         with open(client_secret_json, "w") as f:
             f.write(st.secrets["GOOGLE_CLIENT_SECRET"])
 
