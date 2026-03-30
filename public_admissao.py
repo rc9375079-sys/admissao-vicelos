@@ -148,7 +148,7 @@ def processar_documentos_ia(arquivos_upload):
     if not API_KEY_GEMINI:
         raise ValueError("Chave de API do Gemini não configurada. Defina GEMINI_API_KEY nas variáveis de ambiente ou no arquivo .streamlit/secrets.toml.")
     genai.configure(api_key=API_KEY_GEMINI)
-    modelo = genai.GenerativeModel('gemini-1.5-flash', generation_config={"response_mime_type": "application/json"})
+    modelo = genai.GenerativeModel('gemini-2.5-flash', generation_config={"response_mime_type": "application/json"})
     arquivos_ia = []
     status_bar = st.progress(0, text="Enviando arquivos para a IA...")
     for i, arq in enumerate(arquivos_upload):
