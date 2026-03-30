@@ -12,20 +12,27 @@ def _conn():
         host=os.getenv("DB_HOST", "localhost"),
         port=os.getenv("DB_PORT", "5432"),
         dbname=os.getenv("DB_NAME", "vicelos_erp"),
-        user=os.getenv("DB_USER", "vicelos"),
-        password=os.getenv("DB_PASSWORD", "vicelos"),
+        user=os.getenv("DB_USER", "renancarvalho"),
+        password=os.getenv("DB_PASSWORD", ""),
     )
 
 
-def _to_decimal(raw: Optional[str]) -> Optional[Decimal]:
-    if raw is None:
-        return None
+def _to_decimal(raw: Optional[str]) -> Decimal:
+    if raw is None or raw == "":
+        return Decimal("0.00")
     try:
+        if isinstance(raw, (int, float, Decimal)):
+            return Decimal(str(raw))
         txt = str(raw).replace("R$", "").strip()
-        txt = txt.replace(".", "").replace(",", ".")
+        # Remove thousands separator if it's dot and decimal is comma (Brazilian format)
+        if "," in txt and "." in txt:
+            if txt.rfind(",") > txt.rfind("."):
+                txt = txt.replace(".", "").replace(",", ".")
+        elif "," in txt:
+            txt = txt.replace(",", ".")
         return Decimal(txt)
     except (InvalidOperation, ValueError):
-        return None
+        return Decimal("0.00")
 
 
 def upsert_entidade(nome: str, cpf: str, tipo: str = "funcionario") -> str:
@@ -67,20 +74,24 @@ def get_or_create_cargo(nome: str, cbo: Optional[str], salario_base: Optional[De
         return cur.fetchone()["id"]
 
 
-def upsert_funcionario(entidade_id: str, cargo_id: Optional[str], data_admissao: Optional[date], salario_atual: Optional[Decimal], ctps_numero: Optional[str]) -> str:
+def upsert_funcionario(entidade_id: str, cargo_id: Optional[str], data_admissao: Optional[date], salario_atual: Optional[Decimal], ctps_numero: Optional[str], centro_custo_id: Optional[str] = None, banco: Optional[str] = None, agencia: Optional[str] = None, conta: Optional[str] = None) -> str:
     with _conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO funcionarios (id, entidade_id, cargo_id, data_admissao, salario_atual, ctps_numero)
-            VALUES (gen_random_uuid(), %s, %s, %s, %s, %s)
+            INSERT INTO funcionarios (id, entidade_id, cargo_id, data_admissao, salario_atual, ctps_numero, centro_custo_id, banco, agencia, conta)
+            VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (entidade_id) DO UPDATE
             SET cargo_id = EXCLUDED.cargo_id,
                 data_admissao = COALESCE(EXCLUDED.data_admissao, funcionarios.data_admissao),
                 salario_atual = COALESCE(EXCLUDED.salario_atual, funcionarios.salario_atual),
-                ctps_numero = COALESCE(EXCLUDED.ctps_numero, funcionarios.ctps_numero)
+                ctps_numero = COALESCE(EXCLUDED.ctps_numero, funcionarios.ctps_numero),
+                centro_custo_id = COALESCE(EXCLUDED.centro_custo_id, funcionarios.centro_custo_id),
+                banco = COALESCE(EXCLUDED.banco, funcionarios.banco),
+                agencia = COALESCE(EXCLUDED.agencia, funcionarios.agencia),
+                conta = COALESCE(EXCLUDED.conta, funcionarios.conta)
             RETURNING id;
             """,
-            (entidade_id, cargo_id, data_admissao, salario_atual, ctps_numero),
+            (entidade_id, cargo_id, data_admissao, salario_atual, ctps_numero, centro_custo_id, banco, agencia, conta),
         )
         return cur.fetchone()[0]
 
@@ -115,6 +126,58 @@ def save_admission_record(dados: dict) -> Optional[str]:
     entidade_id = upsert_entidade(nome, cpf, tipo="funcionario")
     cargo_id = get_or_create_cargo(cargo_nome, cbo, salario)
     return upsert_funcionario(entidade_id, cargo_id, data_inicio, salario, ctps)
+
+
+def get_funcionarios_financeiro() -> List[Dict]:
+    """
+    Busca funcionários no Postgres integrando dados de entidades e cargos.
+    """
+    sql = """
+    SELECT 
+        e.id as entidade_id,
+        e.nome, 
+        e.cpf_cnpj as cpf, 
+        f.data_admissao as admissao, 
+        c.nome as cargo, 
+        c.cbo, 
+        f.salario_atual as salario,
+        f.ctps_numero as ctps,
+        f.banco, 
+        f.agencia,
+        f.conta,
+        f.oposicao, 
+        f.vt_diario as "VT Diário",
+        f.va_mensal as "Valor VA",
+        f.vr_mensal as "Valor VR",
+        f.descontar_vt as "Descontar VT",
+        f.descontar_va as "Descontar VA",
+        cc.nome as obra
+    FROM funcionarios f
+    JOIN entidades e ON f.entidade_id = e.id
+    LEFT JOIN cargos c ON f.cargo_id = c.id
+    LEFT JOIN centros_de_custo cc ON f.centro_custo_id = cc.id
+    WHERE e.tipo = 'funcionario'
+    ORDER BY e.nome ASC;
+    """
+    lista = []
+    with _conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql)
+        for row in cur.fetchall():
+            # Formatação para compatibilidade com app.py
+            item = dict(row)
+            if item['admissao']:
+                item['admissao'] = item['admissao'].strftime('%d/%m/%Y')
+            else:
+                item['admissao'] = ""
+            
+            # Garantir que valores numéricos sejam strings formatadas se o app.py as tratar assim
+            # No futuro, o app.py usará Decimal diretamente.
+            item['salario'] = str(item['salario']) if item['salario'] else "0.00"
+            item['VT Diário'] = str(item.get('VT Diário', '0'))
+            item['Valor VA'] = str(item.get('Valor VA', '0'))
+            item['Valor VR'] = str(item.get('Valor VR', '0'))
+            lista.append(item)
+    return lista
 
 
 def health_check() -> tuple[bool, str]:
@@ -274,3 +337,71 @@ def import_nfse_rows(rows: List[Dict]) -> Dict:
                 resumo["erros"].append(f"Linha {idx+1}: {e}")
 
     return resumo
+def save_payroll_record(entidade_id: str, competencia: str, data_pagamento: date, valor_liquido: Decimal, obra: str = "") -> bool:
+    """
+    Grava o resultado do processamento da folha no ERP (tabelas lancamentos e lancamento_itens).
+    Utiliza partidas dobradas: Débito em Custo e Crédito em Salários a Pagar.
+    """
+    conn = _conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                # 1. Obter ID do Centro de Custo pela Obra
+                centro_custo_id = None
+                if obra:
+                    cur.execute("SELECT id FROM centros_de_custo WHERE nome = %s OR codigo = %s LIMIT 1", (obra, obra))
+                    res_cc = cur.fetchone()
+                    if res_cc: centro_custo_id = res_cc[0]
+
+                # 2. Criar o Lançamento Principal (Cabeçalho)
+                # O ID é gerado automaticamente (UUID)
+                cur.execute("""
+                    INSERT INTO lancamentos (data_competencia, descricao, entidade_id, centro_custo_id, numero_documento)
+                    VALUES (%s, %s, %s, %s, %s)
+                    RETURNING id;
+                """, (
+                    competencia, 
+                    f"FOLHA DE PAGAMENTO - {competencia} - {obra}", 
+                    entidade_id, 
+                    centro_custo_id, 
+                    f"FOLHA-{competencia.replace('/', '')}"
+                ))
+                lancamento_id = cur.fetchone()[0]
+
+                # 3. Criar Partidas (Débitos e Créditos)
+                
+                # A. DÉBITO: Custo de Salários (4.1.1.02.000001 - Salários e Ordenados)
+                cur.execute("SELECT id FROM plano_de_contas WHERE codigo = '4.1.1.02.000001' LIMIT 1")
+                row_deb = cur.fetchone()
+                if not row_deb:
+                    # Fallback para conta administrativa
+                    cur.execute("SELECT id FROM plano_de_contas WHERE codigo = '4.2.2.01.000001' LIMIT 1")
+                    row_deb = cur.fetchone()
+                
+                if not row_deb: raise Exception("Conta de Custo de Salários não encontrada no Plano de Contas.")
+                conta_debito_id = row_deb[0]
+
+                # B. CRÉDITO: Salários a Pagar (2.1.5.01.000001)
+                cur.execute("SELECT id FROM plano_de_contas WHERE codigo = '2.1.5.01.000001' LIMIT 1")
+                row_cre = cur.fetchone()
+                if not row_cre: raise Exception("Conta de Salários a Pagar (2.1.5.01.000001) não encontrada.")
+                conta_credito_id = row_cre[0]
+
+                # Executar Inserts nos Itens
+                # Débito
+                cur.execute(
+                    "INSERT INTO lancamento_itens (lancamento_id, conta_id, tipo_partida, valor, status_vencimento) VALUES (%s, %s, %s, %s, %s)",
+                    (lancamento_id, conta_debito_id, 'debito', valor_liquido, 'pendente')
+                )
+                # Crédito
+                cur.execute(
+                    "INSERT INTO lancamento_itens (lancamento_id, conta_id, tipo_partida, valor, data_vencimento, status_vencimento) VALUES (%s, %s, %s, %s, %s, %s)",
+                    (lancamento_id, conta_credito_id, 'credito', valor_liquido, data_pagamento, 'pendente')
+                )
+
+                return True
+    except Exception as e:
+        print(f"Erro ao persistir folha no ERP: {e}")
+        return False
+    finally:
+        conn.close()

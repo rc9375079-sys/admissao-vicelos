@@ -15,7 +15,23 @@ import io
 import pandas as pd
 import zipfile
 from PyPDF2 import PdfReader, PdfWriter
-from db_client import save_admission_record
+from db_client import save_admission_record, get_funcionarios_financeiro, _to_decimal, save_payroll_record
+from decimal import Decimal, ROUND_HALF_UP
+
+def calcular_dias_uteis_proporcionais(adm_str, fech_date):
+    """Calcula dias úteis (Seg-Sex) desde a admissão até o fechamento se no mesmo mês."""
+    try:
+        dt_adm = datetime.strptime(adm_str, '%d/%m/%Y').date()
+        # Se admitido no mesmo mês/ano do fechamento
+        if dt_adm.year == fech_date.year and dt_adm.month == fech_date.month:
+            d_uteis = 0
+            curr = dt_adm
+            while curr <= fech_date:
+                if curr.weekday() < 5: d_uteis += 1
+                curr += timedelta(days=1)
+            return d_uteis
+    except: pass
+    return 22
 
 
 
@@ -47,7 +63,12 @@ MODELOS_ADMISSAO = {
     "06. Acordo Prorrogação": "1XuOQ1Z9MIeotWrbYnsH7XoSCzc24_FJ6MtYt9f3L0eA"
 }
 
-FAIXAS_INSS = [(1518.00, 0.075), (2793.88, 0.09), (4190.83, 0.12), (8157.41, 0.14)]
+FAIXAS_INSS = [
+    (Decimal("1518.00"), Decimal("0.075")), 
+    (Decimal("2793.88"), Decimal("0.09")), 
+    (Decimal("4190.83"), Decimal("0.12")), 
+    (Decimal("8157.41"), Decimal("0.14"))
+]
 
 
 
@@ -202,7 +223,7 @@ def render_public_form():
                     'cargo': '',
                     'cbo': '',
                     'salario': '0,00',
-                    'vt_diario': valor_ida or "0,00",
+                    'VT Diário': valor_ida or "0,00",
                     'data_inicio': datetime.now().strftime('%d/%m/%Y'),
                     'obra': '',
                     'nacionalidade': nacionalidade,
@@ -276,7 +297,9 @@ def conectar_google():
     return build('drive', 'v3', credentials=creds), build('docs', 'v1', credentials=creds), gspread.authorize(creds)
 
 def formatar_moeda(valor):
-    if valor == 0 or valor == "" or valor == 0.0: return ""
+    if not valor or valor == 0 or valor == "0,00": return "0,00"
+    if isinstance(valor, str):
+        valor = _to_decimal(valor)
     return f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 # ==========================================
@@ -397,7 +420,7 @@ def gerar_kit_admissional(dados_finais):
     linha[29] = dados_finais.get('Cidade', dados_finais.get('cidade', ''))
     linha[30] = dados_finais.get('Estado', dados_finais.get('estado', ''))
     linha[31] = dados_finais.get('CEP', dados_finais.get('cep', ''))
-    linha[53] = dados_finais.get('vt_diario', '0,00') 
+    linha[53] = dados_finais.get('VT Diário', '0,00') 
     linha[54] = tags['{{DATA_INICIO}}']; linha[55] = tags['{{FUNCAO}}']
     linha[56] = dados_finais.get('cbo', '')
     linha[57] = tags['{{SALARIO}}']; linha[60] = link_pasta
@@ -427,141 +450,217 @@ def exportar_pdfs_da_pasta(folder_id: str):
 # ==========================================
 
 def calcular_inss(bruto):
-    desconto = 0.0; faixa_ant = 0.0
+    if not isinstance(bruto, Decimal): bruto = _to_decimal(bruto)
+    desconto = Decimal("0.00")
+    faixa_ant = Decimal("0.00")
     for teto, aliq in FAIXAS_INSS:
         if bruto > faixa_ant:
             base = min(bruto, teto) - faixa_ant
             desconto += base * aliq
             faixa_ant = teto
         else: break
-    return round(desconto, 2)
+    return desconto.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+def salvar_log_folha_sheets(lista_dados):
+    """Salva um resumo do processamento de folha em uma aba do Google Sheets para conferência."""
+    if not lista_dados: return
+    try:
+        # Importar internamente para evitar dependências circulares ou pesos desnecessários
+        import gspread
+        _, _, gc = conectar_google()
+        planilha = gc.open_by_key(ID_PLANILHA)
+        
+        try:
+            aba = planilha.worksheet('Log_Processamento_Folha')
+        except:
+            aba = planilha.add_worksheet(title='Log_Processamento_Folha', rows="500", cols="30")
+            aba.append_row([
+                "Data Proc.", "Competência", "CPF", "Nome", 
+                "Sal. Base", "HE+DSR", "Bruto", 
+                "INSS", "IRRF", "VT", "VA", "Sind.", "Faltas", "Atrasos", "Adiant.", 
+                "Tot. Desc.", "Líquido", "FGTS", "Banco"
+            ])
+
+        rows_to_append = []
+        for d in lista_dados:
+            rows_to_append.append([
+                datetime.now().strftime('%d/%m/%Y %H:%M:%S'),
+                d.get('competencia', ''),
+                d.get('cpf', ''),
+                d.get('nome', ''),
+                round(float(d.get('salario_base', 0)), 2),
+                round(float(d.get('he_total', 0)), 2),
+                round(float(d.get('bruto', 0)), 2),
+                round(float(d.get('inss', 0)), 2),
+                round(float(d.get('irrf', 0)), 2),
+                round(float(d.get('vt', 0)), 2),
+                round(float(d.get('va', 0)), 2),
+                round(float(d.get('sindical', 0)), 2),
+                round(float(d.get('faltas', 0)), 2),
+                round(float(d.get('atrasos', 0)), 2),
+                round(float(d.get('adiantamento', 0)), 2),
+                round(float(d.get('desconto_total', 0)), 2),
+                round(float(d.get('liquido', 0)), 2),
+                round(float(d.get('fgts', 0)), 2),
+                d.get('banco', '')
+            ])
+        
+        aba.append_rows(rows_to_append)
+        return True
+    except Exception as e:
+        st.error(f"Erro ao salvar log no Sheets: {e}")
+        return False
 
 def calcular_irrf_2026(bruto, desconto_inss, dependentes=0):
-    deducao_dep = 189.59 * dependentes
+    if not isinstance(bruto, Decimal): bruto = _to_decimal(bruto)
+    if not isinstance(desconto_inss, Decimal): desconto_inss = _to_decimal(desconto_inss)
+    
+    deducao_dep = Decimal("189.59") * Decimal(str(dependentes))
     base_legal = bruto - desconto_inss - deducao_dep
-    base_simplificada = bruto - 607.20
+    base_simplificada = bruto - Decimal("607.20")
     base_calculo = min(base_legal, base_simplificada)
-    if base_calculo <= 2428.80: return 0.0, "ISENTO"
-    elif base_calculo <= 2826.65: imposto_bruto = (base_calculo * 0.075) - 182.16; faixa_str = "7.5%"
-    elif base_calculo <= 3751.05: imposto_bruto = (base_calculo * 0.150) - 394.16; faixa_str = "15.0%"
-    elif base_calculo <= 4664.68: imposto_bruto = (base_calculo * 0.225) - 675.49; faixa_str = "22.5%"
-    else: imposto_bruto = (base_calculo * 0.275) - 908.73; faixa_str = "27.5%"
-    if bruto <= 5000.00: return 0.0, "ISENTO (Lei 15.270)"
-    elif bruto <= 7350.00:
-        reducao = 978.62 - (0.133145 * bruto)
-        imposto_final = max(0.0, imposto_bruto - reducao)
-        return round(imposto_final, 2), faixa_str if imposto_final > 0 else "ISENTO"
-    return round(imposto_bruto, 2), faixa_str
+    
+    # Tabela Tradicional 2026 (Baseada no PDF)
+    if base_calculo <= Decimal("2428.80"): 
+        imposto_bruto = Decimal("0.00")
+        faixa_str = "ISENTO"
+    elif base_calculo <= Decimal("2826.65"): 
+        imposto_bruto = (base_calculo * Decimal("0.075")) - Decimal("182.16")
+        faixa_str = "7.5%"
+    elif base_calculo <= Decimal("3751.05"): 
+        imposto_bruto = (base_calculo * Decimal("0.150")) - Decimal("394.16")
+        faixa_str = "15.0%"
+    elif base_calculo <= Decimal("4664.68"): 
+        imposto_bruto = (base_calculo * Decimal("0.225")) - Decimal("675.49")
+        faixa_str = "22.5%"
+    else: 
+        imposto_bruto = (base_calculo * Decimal("0.275")) - Decimal("908.73")
+        faixa_str = "27.5%"
+    
+    # Regra de Redução Adicional (Nova Tabela 2026)
+    # Redução para quem ganha até R$ 5.000 (Zera o imposto)
+    if bruto <= Decimal("5000.00"): 
+        return Decimal("0.00"), "ISENTO (Redutor 2026)"
+    # Redução Gradual para quem ganha até R$ 7.350
+    elif bruto <= Decimal("7350.00"):
+        reducao = Decimal("978.62") - (Decimal("0.133145") * bruto)
+        imposto_final = max(Decimal("0.00"), imposto_bruto - reducao)
+        return imposto_final.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), (faixa_str if imposto_final > 0 else "ISENTO")
+    
+    return imposto_bruto.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), faixa_str
 
 def calcular_adiantamento_prop(sal_base, adm_str, fecham_str):
-    """
-    Calcula o adiantamento proporcional (40%) seguindo a lógica de mês comercial (30 dias).
-    Passo A: Valor do Dia Comercial (Salário / 30)
-    Passo B: Dias de Direito (Até o último dia do mês, limitado a 30)
-    Passo C: Salário Proporcional Bruto (Valor Dia * Dias Direito)
-    Passo D: Adiantamento (Salário Proporcional * 40%)
-    """
+    if not isinstance(sal_base, Decimal): sal_base = _to_decimal(sal_base)
     try:
         dt_adm = datetime.strptime(adm_str, '%d/%m/%Y')
         dt_fech = datetime.strptime(fecham_str, '%d/%m/%Y')
-        
+
         # Passo A: Valor do Dia Comercial
-        valor_dia = sal_base / 30
-        
-        # Passo B: Dias de Direito no mês de admissão
-        # Se a admissão for no mesmo mês e ano do processamento
-        import calendar
-        ultimo_dia_mes = calendar.monthrange(dt_fech.year, dt_fech.month)[1]
-        
+        valor_dia = sal_base / Decimal("30")
+
+        # Passo B: Dias de Direito no mês de admissão (mês comercial de 30 dias)
         if dt_adm.year == dt_fech.year and dt_adm.month == dt_fech.month:
-            dias_trabalhados = (ultimo_dia_mes - dt_adm.day) + 1
-            # Limite a 30 para seguir o padrão comercial
-            if dias_trabalhados > 30: dias_trabalhados = 30
-            
-            # Passo C: Salário Proporcional Bruto
-            salario_prop = valor_dia * dias_trabalhados
-            
-            # Passo D: O Adiantamento (40%)
-            return round(salario_prop * 0.40, 2)
-        
-        # Se for funcionário antigo (admitido em meses anteriores)
-        return round(sal_base * 0.40, 2)
+            dias_trabalhados = max(0, 30 - dt_adm.day + 1)
+            salario_prop = valor_dia * Decimal(str(dias_trabalhados))
+            return (salario_prop * Decimal("0.40")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        return (sal_base * Decimal("0.40")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     except Exception:
-        return round(sal_base * 0.40, 2)
+        return (sal_base * Decimal("0.40")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 def gerar_holerite_dinamico(dados):
     drive, docs, _ = conectar_google()
-    salario_integral = float(dados['salario_base'].replace('.','').replace(',','.'))
+    salario_integral = _to_decimal(dados['salario_base'])
     tipo_processamento = dados.get('tipo_processamento', 'Fechamento Mensal')
 
     if tipo_processamento == "Adiantamento Quinzenal (Dia 20)":
         bruto = calcular_adiantamento_prop(salario_integral, dados['admissao'], dados['data_fechamento'])
-        liquido = bruto; total_desc = 0.0; fgts = 0.0; inss = 0.0; faixa_irrf = ""
-        # Ajustamos o texto da rubrica se for proporcional
-        fator_texto = f"{ (bruto / salario_integral * 100):.2f}" if bruto < (salario_integral * 0.4) else "40.00"
+        liquido = bruto; total_desc = Decimal("0.00"); fgts = Decimal("0.00"); inss = Decimal("0.00"); faixa_irrf = ""
+
+        try:
+            dt_adm = datetime.strptime(dados['admissao'], '%d/%m/%Y')
+            dt_fech = datetime.strptime(dados['data_fechamento'], '%d/%m/%Y')
+            if dt_adm.year == dt_fech.year and dt_adm.month == dt_fech.month:
+                dias_trab = max(0, 30 - dt_adm.day + 1)
+                base_prop = (salario_integral / Decimal("30")) * Decimal(str(dias_trab))
+            else:
+                base_prop = salario_integral
+        except Exception:
+            base_prop = salario_integral
+
+        fator_texto = f"{(bruto / base_prop * 100):.2f}" if base_prop > 0 else "0.00"
         rubricas = [["001", "ADIANTAMENTO QUINZENAL", fator_texto, formatar_moeda(bruto), ""]]
     else:
         try:
             dt_admissao = datetime.strptime(dados['admissao'], '%d/%m/%Y')
             dt_fechamento = datetime.strptime(dados['data_fechamento'], '%d/%m/%Y')
-            dias_trabalhados = (dt_fechamento - dt_admissao).days + 1 if dt_admissao.month == dt_fechamento.month else 30
+            # Mês comercial 30 dias se admitido em meses anteriores
+            if dt_admissao.month == dt_fechamento.month and dt_admissao.year == dt_fechamento.year:
+                dias_trabalhados = (dt_fechamento - dt_admissao).days + 1
+            else:
+                dias_trabalhados = 30
         except: dias_trabalhados = 30
             
-        salario_proporcional = (salario_integral / 30) * dias_trabalhados
-        val_dia = salario_integral / 30; val_hora = salario_integral / 220
-        he_val = (val_hora * 1.6) * dados.get('qtd_he', 0.0)
-        he_100_val = (val_hora * 2.0) * dados.get('qtd_he_100', 0.0)
-        dsr_val = ((he_val + he_100_val) / 25) * 5 if (he_val + he_100_val) > 0 else 0.0
+        salario_proporcional = (salario_integral / Decimal("30")) * Decimal(str(dias_trabalhados))
+        val_dia = salario_integral / Decimal("30")
+        val_hora = salario_integral / Decimal("220")
+        
+        he_val = (val_hora * Decimal("1.6")) * Decimal(str(dados.get('qtd_he', 0.0)))
+        he_100_val = (val_hora * Decimal("2.0")) * Decimal(str(dados.get('qtd_he_100', 0.0)))
+        dsr_val = ((he_val + he_100_val) / Decimal("25")) * Decimal("5") if (he_val + he_100_val) > 0 else Decimal("0.00")
         
         # 1. Soma dos Vencimentos (Bruto)
         bruto = salario_proporcional + he_val + he_100_val + dsr_val
         
         # 2. Desconto de Faltas, DSR e Atrasos
-        val_faltas = dados.get('dias_faltas', 0) * val_dia
-        val_dsr_perdido = dados.get('dsr_descontado', 0) * val_dia
-        val_atrasos = dados.get('horas_atrasos', 0.0) * val_hora
+        val_faltas = Decimal(str(dados.get('dias_faltas', 0))) * val_dia
+        val_dsr_perdido = Decimal(str(dados.get('dsr_descontado', 0))) * val_dia
+        val_atrasos = Decimal(str(dados.get('horas_atrasos', 0.0))) * val_hora
         
         # 3. Base Real de Impostos (O que sobra depois das faltas)
         base_impostos = bruto - val_faltas - val_dsr_perdido - val_atrasos
-        if base_impostos < 0: base_impostos = 0.0
+        if base_impostos < 0: base_impostos = Decimal("0.00")
         
         # 4. Cálculo dos Impostos sobre a Base Real
         inss = calcular_inss(base_impostos)
-        irrf, faixa_irrf = calcular_irrf_2026(base_impostos, inss)
+        irrf, faixa_irrf = calcular_irrf_2026(base_impostos, inss, dependentes=dados.get('dependentes', 0))
         
-        # 5. Novo Motor de Vale Transporte (Duplicação removida)
-        dias_uteis_vt = dados.get('dias_uteis_vt', 22)
-        try:
-            custo_diario_vt = float(str(dados.get('vt_diario', '0')).replace('R$', '').replace('.', '').replace(',', '.'))
-        except:
-            custo_diario_vt = 0.0
+        # 5. Novo Motor de Vale Transporte
+        desc_vt_flag = dados.get('Descontar VT', False)
+        dias_uteis_vt = Decimal(str(dados.get('Dias Úteis VT', 22)))
+        custo_diario_vt = _to_decimal(dados.get('VT Diário', '0'))
             
         custo_total_vt = custo_diario_vt * dias_uteis_vt
-        limite_6_pct = salario_proporcional * 0.06
-        vt = min(custo_total_vt, limite_6_pct) if custo_total_vt > 0 else limite_6_pct
+        limite_6_pct = salario_proporcional * Decimal("0.06")
+        vt = min(custo_total_vt, limite_6_pct) if (custo_total_vt > 0 and desc_vt_flag) else Decimal("0.00")
         
         # 6. Outros Descontos
-        adiantamento = calcular_adiantamento_prop(salario_integral, dados['admissao'], dados['data_fechamento']) if dados.get('pagar_adiantamento', False) else 0.0
+        adiantamento = calcular_adiantamento_prop(salario_integral, dados['admissao'], dados['data_fechamento']) if dados.get('Desc. Adiant.?', False) else Decimal("0.00")
         
-        if dados.get('descontar_cesta', False):
-            desc_cesta = round((24.25 / 30) * dias_trabalhados, 2)
+        if dados.get('Descontar VA', False):
+            # Usar o valor do banco se existir, ou o proporcional de 485,00
+            va_cheio = _to_decimal(dados.get('Valor VA', '0'))
+            if va_cheio <= 0: va_cheio = Decimal("485.00")
+            # O desconto é de 5% sobre o valor do benefício (que por sua vez é proporcional aos dias)
+            beneficio_prop = ((va_cheio / Decimal("30")) * Decimal(str(dias_trabalhados))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            desc_cesta = (beneficio_prop * Decimal("0.05")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         else:
-            desc_cesta = 0.0
+            desc_cesta = Decimal("0.00")
             
-        desc_sindical = min(base_impostos * 0.01, 46.30) if dados.get('oposicao', 'NÃO').strip().upper() != 'SIM' else 0.0
+        desc_sindical = min(base_impostos * Decimal("0.01"), Decimal("46.30")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) if str(dados.get('oposicao', '')).strip().upper() != 'SIM' else Decimal("0.00")
         
         # 7. Totalizadores
         total_desc = inss + vt + irrf + adiantamento + val_faltas + val_dsr_perdido + val_atrasos + desc_cesta + desc_sindical
         liquido = bruto - total_desc
-        fgts = base_impostos * 0.08  # Ajustado também para calcular o FGTS apenas sobre os dias trabalhados
+        fgts = (base_impostos * Decimal("0.08")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         
         rubricas = [["001", "SALARIO BASE", f"{dias_trabalhados} .00", formatar_moeda(salario_proporcional), ""]]
         if he_val > 0: rubricas.append(["002", "HORAS EXTRAS 60%", f"{dados.get('qtd_he')}", formatar_moeda(he_val), ""])
         if he_100_val > 0: rubricas.append(["004", "HORAS EXTRAS 100%", f"{dados.get('qtd_he_100')}", formatar_moeda(he_100_val), ""])
         if dsr_val > 0: rubricas.append(["003", "D.S.R. S/ VARIAVEIS", "", formatar_moeda(dsr_val), ""])
-        if inss > 0: rubricas.append(["101", "INSS", f"{(inss/bruto*100):.2f}", "", formatar_moeda(inss)])
+        if inss > 0: rubricas.append(["101", "INSS", f"{(inss/base_impostos*100):.2f}" if base_impostos > 0 else "0.00", "", formatar_moeda(inss)])
         if irrf > 0: rubricas.append(["102", "IRRF", faixa_irrf, "", formatar_moeda(irrf)])
-        if vt > 0: rubricas.append(["103", "VALE TRANSPORTE", "", "", formatar_moeda(vt)])
+        if vt > 0: rubricas.append(["103", "VALE TRANSPORTE", "6,00 %", "", formatar_moeda(vt)])
         if adiantamento > 0: rubricas.append(["104", "ADIANTAMENTO", "", "", formatar_moeda(adiantamento)])
         if desc_cesta > 0: rubricas.append(["107", "VALE ALIMENTAÇÃO", "5.00", "", formatar_moeda(desc_cesta)])
         if desc_sindical > 0: rubricas.append(["108", "CONTRIB. SINDICAL", "1.00", "", formatar_moeda(desc_sindical)])
@@ -574,15 +673,12 @@ def gerar_holerite_dinamico(dados):
         '{{MES_REFERENCIA}}': datetime.strptime(dados['data_fechamento'], '%d/%m/%Y').strftime('%m/%Y'), '{{DATA_HOJE}}': datetime.now().strftime('%d/%m/%Y'),
         '{{OBRA}}': dados['obra'], '{{DATA_INICIO}}': dados.get('admissao', ''), '{{SALARIO}}': formatar_moeda(salario_integral), 
         '{{TOTAL_VENC}}': formatar_moeda(bruto), '{{TOTAL_DESC}}': formatar_moeda(total_desc), '{{VALOR_LIQUIDO}}': formatar_moeda(liquido),
-        '{{VALOR_EXTENSO}}': num2words(liquido, lang='pt_BR', to='currency'), 
+        '{{VALOR_EXTENSO}}': num2words(float(liquido), lang='pt_BR', to='currency'), 
         
-        # --- AS BASES CORRIGIDAS ESTÃO AQUI ---
-        '{{BASE_INSS}}': formatar_moeda(base_impostos if tipo_processamento != "Adiantamento Quinzenal (Dia 20)" else 0), 
-        '{{BASE_FGTS}}': formatar_moeda(base_impostos if tipo_processamento != "Adiantamento Quinzenal (Dia 20)" else 0), 
+        '{{BASE_INSS}}': formatar_moeda(base_impostos if tipo_processamento != "Adiantamento Quinzenal (Dia 20)" else Decimal("0.00")), 
+        '{{BASE_FGTS}}': formatar_moeda(base_impostos if tipo_processamento != "Adiantamento Quinzenal (Dia 20)" else Decimal("0.00")), 
         '{{VALOR_FGTS}}': formatar_moeda(fgts), 
-        '{{BASE_IRRF}}': formatar_moeda((base_impostos - inss) if tipo_processamento != "Adiantamento Quinzenal (Dia 20)" else 0), 
-        # --------------------------------------
-        
+        '{{BASE_IRRF}}': formatar_moeda((base_impostos - inss) if tipo_processamento != "Adiantamento Quinzenal (Dia 20)" else Decimal("0.00")), 
         '{{FAIXA_IRRF}}': faixa_irrf
     }
     for i in range(12):
@@ -592,7 +688,27 @@ def gerar_holerite_dinamico(dados):
     copia = drive.files().copy(fileId=ID_MODELO_HOLERITE, body={'name': f"Holerite - {dados['nome']}", 'parents': [ID_PASTA_RAIZ]}).execute()
     reqs = [{'replaceAllText': {'containsText': {'text': k, 'matchCase': True}, 'replaceText': str(v)}} for k, v in tags.items()]
     docs.documents().batchUpdate(documentId=copia.get('id'), body={'requests': reqs}).execute()
-    return f"https://docs.google.com/document/d/{copia.get('id')}/edit", liquido
+    
+    detalhes = {
+        'salario_base': salario_proporcional if tipo_processamento != "Adiantamento Quinzenal (Dia 20)" else bruto,
+        'he_60': he_val if tipo_processamento != "Adiantamento Quinzenal (Dia 20)" else Decimal("0.00"),
+        'he_100': he_100_val if tipo_processamento != "Adiantamento Quinzenal (Dia 20)" else Decimal("0.00"),
+        'dsr': dsr_val if tipo_processamento != "Adiantamento Quinzenal (Dia 20)" else Decimal("0.00"),
+        'bruto': bruto,
+        'inss': inss,
+        'irrf': irrf,
+        'vt': vt,
+        'va': desc_cesta,
+        'adiantamento': adiantamento if tipo_processamento != "Adiantamento Quinzenal (Dia 20)" else Decimal("0.00"),
+        'desc_total': total_desc,
+        'liquido': liquido,
+        'faltas': val_faltas + val_dsr_perdido,
+        'atrasos': val_atrasos,
+        'sindical': desc_sindical,
+        'base_calc': base_impostos,
+        'fgts': fgts
+    }
+    return f"https://docs.google.com/document/d/{copia.get('id')}/edit", liquido, detalhes
 
 def gerar_excel_banco_inter(lista_pagamentos, total_folha):
     import openpyxl
@@ -693,22 +809,46 @@ def gerar_excel_banco_inter(lista_pagamentos, total_folha):
     return output.getvalue()
 
 def buscar_funcionarios():
-    _, _, gc = conectar_google()
-    aba = gc.open_by_key(ID_PLANILHA).worksheet('Base_de_Dados_Funcionarios')
-    dados = aba.get_all_values()
-    lista = []
-    for linha in dados[1:]:
-        if len(linha) > 50 and linha[2] and (linha[62] if len(linha) > 62 else "ATIVO").strip().upper() != "INATIVO":
-            lista.append({
-                'nome': linha[2], 'cpf': linha[12], 'admissao': linha[54], 
-                'cargo': linha[55], 'cbo': linha[56], 'salario': linha[57], 
-                'banco': linha[46] if len(linha) > 46 else "",
-                'conta': linha[48], 'oposicao': linha[61], 'obra': linha[64],
-                'vt_diario': linha[52] if len(linha) > 52 else "0,00",
-                'va_mensal': linha[58] if len(linha) > 58 else "0,00",
-                'vr_mensal': linha[59] if len(linha) > 59 else "0,00"
-            })
-    return lista
+    # 1. Tentar Postgres (Prioritário)
+    lista_db = []
+    try:
+        lista_db = get_funcionarios_financeiro()
+    except Exception as e:
+        st.warning(f"Erro ao buscar funcionários no Banco de Dados: {e}")
+
+    # 2. Tentar Google Sheets (Fallback/Legado)
+    lista_sheets = []
+    try:
+        _, _, gc = conectar_google()
+        aba = gc.open_by_key(ID_PLANILHA).worksheet('Base_de_Dados_Funcionarios')
+        dados = aba.get_all_values()
+        for linha in dados[1:]:
+            if len(linha) > 50 and linha[2] and (linha[62] if len(linha) > 62 else "ATIVO").strip().upper() != "INATIVO":
+                lista_sheets.append({
+                    'nome': linha[2], 'cpf': linha[12], 'admissao': linha[54], 
+                    'cargo': linha[55], 'cbo': linha[56], 'salario': linha[57], 
+                    'banco': linha[46] if len(linha) > 46 else "",
+                    'conta': linha[48], 'oposicao': linha[61], 'obra': linha[64],
+                    'VT Diário': linha[52] if len(linha) > 52 else "0,00",
+                    'Valor VA': linha[58] if len(linha) > 58 else "0,00",
+                    'Valor VR': linha[59] if len(linha) > 59 else "0,00",
+                    'Descontar VT': True,
+                    'Descontar VA': True
+                })
+    except Exception as e:
+        st.warning(f"Erro ao buscar funcionários no Google Sheets: {e}")
+
+    # 3. Mesclagem Inteligente (Merge por CPF)
+    # Se o CPF já existe no DB, preferimos os dados do DB (que tendem a estar mais atualizados com o ERP)
+    cpfs_db = {f['cpf'].replace('.','').replace('-','').strip() for f in lista_db}
+    
+    final_list = list(lista_db)
+    for fs in lista_sheets:
+        cpf_s = fs['cpf'].replace('.','').replace('-','').strip()
+        if cpf_s not in cpfs_db:
+            final_list.append(fs)
+            
+    return final_list
 
 # ==========================================
 # NOVO MÓDULO: SIMULADOR DE DESLIGAMENTO
@@ -718,17 +858,12 @@ def calcular_cenarios_desligamento(func_dados, data_desligamento):
     try: dt_adm = datetime.strptime(func_dados['admissao'], '%d/%m/%Y').date()
     except Exception as e: return None
     
-    try: salario = float(func_dados['salario'].replace('.', '').replace(',', '.'))
-    except: salario = 0.0
-    
-    try: va_mensal = float(str(func_dados.get('va_mensal', '0')).replace('R$', '').replace('.', '').replace(',', '.'))
-    except: va_mensal = 0.0
-    try: vr_mensal = float(str(func_dados.get('vr_mensal', '0')).replace('R$', '').replace('.', '').replace(',', '.'))
-    except: vr_mensal = 0.0
-    try: vt_diario = float(str(func_dados.get('vt_diario', '0')).replace('R$', '').replace('.', '').replace(',', '.'))
-    except: vt_diario = 0.0
+    salario = _to_decimal(func_dados.get('salario', '0'))
+    va_mensal = _to_decimal(func_dados.get('Valor VA', '0'))
+    vr_mensal = _to_decimal(func_dados.get('vr_mensal', '0'))
+    vt_diario = _to_decimal(func_dados.get('VT Diário', '0'))
         
-    valor_dia = salario / 30
+    valor_dia = salario / Decimal("30")
     
     dt_fim_45 = dt_adm + timedelta(days=44)
     dt_fim_90 = dt_adm + timedelta(days=89)
@@ -748,40 +883,40 @@ def calcular_cenarios_desligamento(func_dados, data_desligamento):
         fase = "Contrato por Prazo Indeterminado"
         dt_alvo = None; dias_restantes = 0; total_dias_projetados = dias_trabalhados_hoje
 
-    multa_479 = (dias_restantes * valor_dia) / 2 if dias_restantes > 0 else 0
+    multa_479 = ((Decimal(str(dias_restantes)) * valor_dia) / Decimal("2")) if dias_restantes > 0 else Decimal("0.00")
     
     # 1. AVOS E FGTS (CENÁRIO A)
     meses_cheios_hoje = dias_trabalhados_hoje // 30
     dias_sobra_hoje = dias_trabalhados_hoje % 30
     avos_hoje = meses_cheios_hoje + (1 if dias_sobra_hoje >= 15 else 0)
     
-    ferias_hoje = (salario / 12) * avos_hoje
-    terco_hoje = ferias_hoje / 3
-    decimo_hoje = (salario / 12) * avos_hoje
+    ferias_hoje = (salario / Decimal("12")) * Decimal(str(avos_hoje))
+    terco_hoje = ferias_hoje / Decimal("3")
+    decimo_hoje = (salario / Decimal("12")) * Decimal(str(avos_hoje))
     
     # Estimativa de Multa FGTS 40% (Saldo Base = Salários pagos + 13º proporcional)
-    base_fgts_acumulada = (valor_dia * dias_trabalhados_hoje) + decimo_hoje
-    saldo_fgts_est = base_fgts_acumulada * 0.08
-    multa_fgts_hoje = saldo_fgts_est * 0.40
+    base_fgts_acumulada = (valor_dia * Decimal(str(dias_trabalhados_hoje))) + decimo_hoje
+    saldo_fgts_est = base_fgts_acumulada * Decimal("0.08")
+    multa_fgts_hoje = saldo_fgts_est * Decimal("0.40")
     
     # Custo de Benefícios Consumidos (Cenário A)
-    dias_uteis_trabalhados = round(dias_trabalhados_hoje * 0.73)
+    dias_uteis_trabalhados = Decimal(str(int(dias_trabalhados_hoje * 0.73)))
     vt_gasto_hoje = dias_uteis_trabalhados * vt_diario
-    va_gasto_hoje = (va_mensal / 30) * dias_trabalhados_hoje
-    vr_gasto_hoje = (vr_mensal / 30) * dias_trabalhados_hoje
+    va_gasto_hoje = (va_mensal / Decimal("30")) * Decimal(str(dias_trabalhados_hoje))
+    vr_gasto_hoje = (vr_mensal / Decimal("30")) * Decimal(str(dias_trabalhados_hoje))
 
     # 2. AVOS PROJETADOS (CENÁRIO B)
     meses_cheios_proj = total_dias_projetados // 30
     dias_sobra_proj = total_dias_projetados % 30
     avos_proj = meses_cheios_proj + (1 if dias_sobra_proj >= 15 else 0)
     
-    ferias_proj = (salario / 12) * avos_proj
-    terco_proj = ferias_proj / 3
-    decimo_proj = (salario / 12) * avos_proj
+    ferias_proj = (salario / Decimal("12")) * Decimal(str(avos_proj))
+    terco_proj = ferias_proj / Decimal("3")
+    decimo_proj = (salario / Decimal("12")) * Decimal(str(avos_proj))
     
     # 3. FATIAMENTO DE CAIXA (CENÁRIO B)
-    salario_folha_mensal = 0.0
-    salario_rescisao_futura = 0.0
+    salario_folha_mensal = Decimal("0.00")
+    salario_rescisao_futura = Decimal("0.00")
     dias_rescisao_futura = 0
     
     if dias_restantes > 0:
@@ -790,34 +925,44 @@ def calcular_cenarios_desligamento(func_dados, data_desligamento):
         dias_ate_fim_mes = (date(data_desligamento.year, data_desligamento.month, ultimo_dia_mes_atual) - data_desligamento).days
         
         if dt_alvo.month == data_desligamento.month:
-            salario_folha_mensal = dias_restantes * valor_dia
+            salario_folha_mensal = Decimal(str(dias_restantes)) * valor_dia
             dias_rescisao_futura = 0
         else:
-            salario_folha_mensal = dias_ate_fim_mes * valor_dia
+            salario_folha_mensal = Decimal(str(dias_ate_fim_mes)) * valor_dia
             dias_rescisao_futura = dias_restantes - dias_ate_fim_mes
-            salario_rescisao_futura = dias_rescisao_futura * valor_dia
+            salario_rescisao_futura = Decimal(str(dias_rescisao_futura)) * valor_dia
 
     # VA/VR Futuros (Apenas para os dias do mês de rescisão)
-    va_projetado = (va_mensal / 30) * dias_rescisao_futura
-    vr_projetado = (vr_mensal / 30) * dias_rescisao_futura
+    va_projetado = (va_mensal / Decimal("30")) * Decimal(str(dias_rescisao_futura))
+    vr_projetado = (vr_mensal / Decimal("30")) * Decimal(str(dias_rescisao_futura))
     
     return {
         "dias_trabalhados_hoje": dias_trabalhados_hoje, "fase": fase,
         "dt_alvo": dt_alvo.strftime('%d/%m/%Y') if dt_alvo else "N/A",
-        "dias_restantes": dias_restantes, "multa_479": multa_479,
+        "dias_restantes": dias_restantes, "multa_479": multa_479.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
         
-        "avos_hoje": avos_hoje, "ferias_hoje": ferias_hoje, "terco_hoje": terco_hoje, "decimo_hoje": decimo_hoje,
-        "multa_fgts_hoje": multa_fgts_hoje,
-        "vt_gasto_hoje": vt_gasto_hoje, "va_gasto_hoje": va_gasto_hoje, "vr_gasto_hoje": vr_gasto_hoje,
+        "avos_hoje": avos_hoje, 
+        "ferias_hoje": ferias_hoje.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), 
+        "terco_hoje": terco_hoje.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), 
+        "decimo_hoje": decimo_hoje.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+        "multa_fgts_hoje": multa_fgts_hoje.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+        "vt_gasto_hoje": vt_gasto_hoje.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), 
+        "va_gasto_hoje": va_gasto_hoje.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), 
+        "vr_gasto_hoje": vr_gasto_hoje.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
         
-        "avos_proj": avos_proj, "ferias_proj": ferias_proj, "terco_proj": terco_proj, "decimo_proj": decimo_proj,
+        "avos_proj": avos_proj, 
+        "ferias_proj": ferias_proj.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), 
+        "terco_proj": terco_proj.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), 
+        "decimo_proj": decimo_proj.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
         
-        "salario_folha_mensal": salario_folha_mensal,
-        "salario_rescisao_futura": salario_rescisao_futura, "dias_rescisao_futura": dias_rescisao_futura,
-        "va_projetado": va_projetado, "vr_projetado": vr_projetado,
+        "salario_folha_mensal": salario_folha_mensal.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+        "salario_rescisao_futura": salario_rescisao_futura.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), 
+        "dias_rescisao_futura": dias_rescisao_futura,
+        "va_projetado": va_projetado.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), 
+        "vr_projetado": vr_projetado.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
         "va_mensal_cheio": va_mensal, "vr_mensal_cheio": vr_mensal,
         
-        "salario_saldo_hoje": (data_desligamento.day * valor_dia)
+        "salario_saldo_hoje": (Decimal(str(data_desligamento.day)) * valor_dia).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     }
 
 # ==========================================
@@ -878,6 +1023,14 @@ def classificar_e_splitar_pdf(pdf_file):
             if paginas_adicionadas:
                 output_pdf = io.BytesIO()
                 writer.write(output_pdf)
+                
+                nome_func = doc.get("funcionario", "Desconhecido").replace(" ", "_").replace("/", "-")
+                tipo_doc = doc.get("tipo", "Documento").replace(" ", "_").replace("/", "-")
+                nome_arquivo = f"{nome_func}_{tipo_doc}.pdf"
+                
+                zip_file.writestr(nome_arquivo, output_pdf.getvalue())
+                
+    return zip_buffer.getvalue()
 
 # ==========================================
 # 6. FRONT-END
@@ -913,8 +1066,8 @@ if abrir_sql:
                 host=os.getenv("DB_HOST", "localhost"),
                 port=os.getenv("DB_PORT", "5432"),
                 dbname=os.getenv("DB_NAME", "vicelos_erp"),
-                user=os.getenv("DB_USER", "vicelos"),
-                password=os.getenv("DB_PASSWORD", "vicelos"),
+                user=os.getenv("DB_USER", "renancarvalho"),
+                password=os.getenv("DB_PASSWORD", ""),
             )
             df = pd.read_sql(sql_text, conn)
             st.dataframe(df)
@@ -974,7 +1127,7 @@ if menu == "👥 Admissão Inteligente":
                     dados_finais = {
                         'nome': nome, 'cpf': cpf, 'rg': rg, 'pis': pis, 
                         'cargo': cargo, 'cbo': cbo, 'salario': salario, 
-                        'vt_diario': vt_diario,
+                        'VT Diário': vt_diario,
                         'data_inicio': inicio, 'obra': obra_selecionada, 
                         'nacionalidade': nacionalidade, 'estado_civil': est_civil,
                         'Logradouro': logradouro, 'Numero Endereco': numero, 
@@ -1016,7 +1169,7 @@ elif menu == "💰 Folha de Pagamento":
                     
                     if st.form_submit_button("Gerar"):
                         with st.spinner("Gerando..."):
-                            link, _ = gerar_holerite_dinamico({
+                            link, _, _ = gerar_holerite_dinamico({
                                 **func, 
                                 'salario_base': func['salario'], 
                                 'data_fechamento': data_f.strftime('%d/%m/%Y'), 
@@ -1026,37 +1179,73 @@ elif menu == "💰 Folha de Pagamento":
                                 'dsr_descontado': dsr, 
                                 'horas_atrasos': atraso, 
                                 'dias_uteis_vt': dias_vt,
-                                'pagar_adiantamento': p_vale, 
-                                'descontar_cesta': d_cesta, 
+                                'Desc. Adiant.?': p_vale, 
+                                'Desc. VA?': d_cesta, 
                                 'tipo_processamento': tipo_p
                             })
                             st.session_state.ultimo_holerite = link; st.rerun()
     with aba2:
         c_t, c_d, c_p, c_f = st.columns([2, 1, 1, 1])
-        t_lote = c_t.radio("Lote:", ["Fechamento Mensal", "Adiantamento Quinzenal (Dia 20)"], horizontal=True)
-        d_deb = c_d.date_input("Débito", value=date.today(), format="DD/MM/YYYY")
-        d_pag = c_p.date_input("Crédito", value=date.today(), format="DD/MM/YYYY")
-        data_fechamento_lote = c_f.date_input("Fechamento", value=date(2026, 2, 28), format="DD/MM/YYYY")
+        t_lote = c_t.radio("Lote:", ["Fechamento Mensal", "Adiantamento Quinzenal (Dia 20)"], horizontal=True, key="tipo_lote_radio")
+        d_deb = c_d.date_input("Débito", value=date.today(), format="DD/MM/YYYY", key="data_debito_lote")
+        d_pag = c_p.date_input("Crédito", value=date.today(), format="DD/MM/YYYY", key="data_pagto_lote")
+        
+        # Calcula o último dia do mês corrente como padrão sensível
+        hoje = date.today()
+        proximo_mes = hoje.replace(day=28) + timedelta(days=4)
+        ultimo_dia_mes = proximo_mes - timedelta(days=proximo_mes.day)
+        data_fechamento_lote = c_f.date_input("Fechamento", value=ultimo_dia_mes, format="DD/MM/YYYY", key="data_fechamento_lote_widget")
         
         if st.button("📊 Carregar Tabela"):
              df = pd.DataFrame(buscar_funcionarios())
              if not df.empty:
                  df.insert(0, 'Selecionar', True)
+                 # Garante que a data de fechamento segue o input do usuário na hora de carregar
                  df['Data Fechamento'] = data_fechamento_lote.strftime('%d/%m/%Y')
-                 df['HE 60%'] = 0.0; df['HE 100%'] = 0.0; df['Faltas'] = 0; df['DSR Perdido'] = 0; df['Atrasos (Hrs)'] = 0.0; df['Dias Úteis VT'] = 22; 
+                 df['HE 60%'] = 0.0; df['HE 100%'] = 0.0; df['Faltas'] = 0; df['DSR Perdido'] = 0; df['Atrasos (Hrs)'] = 0.0; 
+                 
+                 # Cálculo Automático de Dias Úteis VT para novos admitidos
+                 df['Dias Úteis VT'] = df['admissao'].apply(lambda x: calcular_dias_uteis_proporcionais(x, data_fechamento_lote))
+                 if 'VT Diário' not in df.columns: df['VT Diário'] = 0.0
                  df['Desc. Adiant.?'] = False if t_lote == "Adiantamento Quinzenal (Dia 20)" else True
-                 df['Desc. VA?'] = True
+                 if 'Descontar VT' not in df.columns: df['Descontar VT'] = True
+                 if 'Descontar VA' not in df.columns: df['Descontar VA'] = True
+
+                 # Reordenar colunas para melhor visualização (grupos de descontos lado a lado)
+                 ordem_visual = [
+                     'Selecionar', 'nome', 'cpf', 'admissao', 'salario', 
+                     'VT Diário', 'Descontar VT', 'Dias Úteis VT', 
+                     'Valor VA', 'Descontar VA', 'Valor VR', 
+                     'Desc. Adiant.?', 'Data Fechamento', 
+                     'HE 60%', 'HE 100%', 'Faltas', 'DSR Perdido', 'Atrasos (Hrs)',
+                     'banco', 'agencia', 'conta', 'obra'
+                 ]
+                 cols_final = [c for c in ordem_visual if c in df.columns]
+                 cols_resto = [c for c in df.columns if c not in cols_final]
+                 df = df[cols_final + cols_resto]
+
              st.session_state.df_lote = df
         if st.session_state.df_lote is not None and not st.session_state.df_lote.empty:
-            df_ed = st.data_editor(st.session_state.df_lote, hide_index=True)
+            df_ed = st.data_editor(
+                st.session_state.df_lote, 
+                hide_index=True,
+                column_config={
+                    "banco": st.column_config.TextColumn("Banco"),
+                    "agencia": st.column_config.TextColumn("Agência"),
+                    "conta": st.column_config.TextColumn("Conta")
+                }
+            )
             if st.button("🚀 Processar Geral"):
-                links = []; l_inter = []; t_folha = 0.0; bar = st.progress(0)
+                links = []; l_inter = []; t_folha = Decimal("0.00"); bar = st.progress(0)
                 df_selecionados = df_ed[df_ed['Selecionar'] == True]
                 if df_selecionados.empty:
                     st.warning("Nenhum funcionário selecionado.")
                 else:
-                    for i, (index, row) in enumerate(df_selecionados.iterrows()):
-                        link, liq = gerar_holerite_dinamico({
+# --- NOVO: COLETA DE LOGS PARA O SHEETS ---
+                    logs_financeiros = []
+# -----------------------------------------
+                    for i, row in df_selecionados.iterrows():
+                        link, liq, det = gerar_holerite_dinamico({
                             **row, 
                             'salario_base': row['salario'], 
                             'data_fechamento': row['Data Fechamento'], 
@@ -1065,29 +1254,78 @@ elif menu == "💰 Folha de Pagamento":
                             'dias_faltas': row['Faltas'], 
                             'dsr_descontado': row['DSR Perdido'], 
                             'horas_atrasos': row['Atrasos (Hrs)'], 
-                            'dias_uteis_vt': row['Dias Úteis VT'],
-                            'pagar_adiantamento': row['Desc. Adiant.?'], 
-                            'descontar_cesta': row['Desc. VA?'], 
+                            'Dias Úteis VT': row['Dias Úteis VT'],
+                            'VT Diário': row.get('VT Diário', 0),
+                            'Descontar VT': row.get('Descontar VT', True),
+                            'Desc. Adiant.?': row['Desc. Adiant.?'], 
+                            'Descontar VA': row['Descontar VA'], 
+                            'Valor VA': row.get('Valor VA', 0),
                             'tipo_processamento': t_lote
                         })
-                        t_folha += liq; l_inter.append({"Nome": row['nome'], "CPF": row['cpf'], "Conta": row['conta'], "Valor": round(liq, 2), "Data Debito": d_deb.strftime('%d/%m/%Y'), "Data Pagamento": d_pag.strftime('%d/%m/%Y')})
+                        t_folha += liq; l_inter.append({"Nome": row['nome'], "CPF": row['cpf'], "Conta": row['conta'], "Valor": round(float(liq), 2), "Data Debito": d_deb.strftime('%d/%m/%Y'), "Data Pagamento": d_pag.strftime('%d/%m/%Y')})
                         links.append(f"- **{row['nome']}:** [Holerite]({link})"); bar.progress((i+1)/len(df_selecionados))
                         
-                        # --- INTEGRAÇÃO ERP: POST DO HOLERITE ---
+                        # --- INTEGRAÇÃO ERP: PERSISTÊNCIA NO BANCO DE DADOS ---
+                        try:
+                            # Se tivermos o entidade_id (vindo do Postgres), salvamos diretamente
+                            ent_id = row.get('entidade_id')
+                            if ent_id:
+                                save_payroll_record(
+                                    entidade_id=ent_id,
+                                    competencia=row['Data Fechamento'],
+                                    data_pagamento=d_pag,
+                                    valor_liquido=liq,
+                                    obra=row.get('obra', '')
+                                )
+                        except Exception as e:
+                            st.error(f"Erro ao persistir lançamento no banco: {e}")
+                        # -----------------------------------------------------
+                        
+                        # --- COLETAR LOG DETALHADO PARA O SHEETS ---
+                        logs_financeiros.append({
+                            "competencia": row['Data Fechamento'],
+                            "cpf": row['cpf'],
+                            "nome": row['nome'],
+                            "salario_base": det['salario_base'],
+                            "he_total": det['he_60'] + det['he_100'] + det['dsr'],
+                            "bruto": det['bruto'],
+                            "inss": det['inss'],
+                            "irrf": det['irrf'],
+                            "vt": det['vt'],
+                            "va": det['va'],
+                            "faltas": det['faltas'],
+                            "atrasos": det['atrasos'],
+                            "sindical": det['sindical'],
+                            "adiantamento": det['adiantamento'],
+                            "desconto_total": det['desc_total'],
+                            "liquido": det['liquido'],
+                            "fgts": det['fgts'],
+                            "banco": "Postgres" if row.get('entidade_id') else "Google Sheets"
+                        })
+                        # ---------------------------------
+                        
+                        # --- INTEGRAÇÃO ERP: POST DO HOLERITE (Legado/API) ---
                         import requests
                         try:
                             payload_folha = {
-                                "cpf_funcionario": row['cpf'].replace(".", "").replace("-", "").strip(),
+                                "cpf_funcionario": str(row['cpf']).replace(".", "").replace("-", "").strip(),
                                 "competencia_texto": row['Data Fechamento'],
                                 "data_pagamento": d_pag.strftime('%Y-%m-%d'),
-                                "salario_liquido": liq
+                                "salario_liquido": float(liq)
                             }
                             # Envia para a porta 8000 (onde o Uvicorn estará rodando em background)
                             requests.post("http://localhost:8000/lancamentos/folha", json=payload_folha, timeout=3)
                         except:
                             pass # Em produção deveríamos logar.
                         # ----------------------------------------
-                st.download_button("📥 Baixar Planilha Inter", gerar_excel_banco_inter(l_inter, t_folha), f"Folha_{datetime.now().strftime('%Y%m%d')}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    
+                    # --- NOVO: SALVAR LOG NO GOOGLE SHEETS ---
+                    if logs_financeiros:
+                        with st.spinner("Salvando log no Google Sheets..."):
+                            salvar_log_folha_sheets(logs_financeiros)
+                    # ------------------------------------------
+
+                st.download_button("📥 Baixar Planilha Inter", gerar_excel_banco_inter(l_inter, float(t_folha)), f"Folha_{datetime.now().strftime('%Y%m%d')}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                 st.markdown("\n".join(links))
 
 elif menu == "📂 Organizador de Scans":
@@ -1147,24 +1385,30 @@ elif menu == "⚖️ Simulador de Desligamento":
                 st.warning(f"**CENÁRIO A: Desligar Hoje ({dt_proj_desligamento.strftime('%d/%m/%Y')})**")
                 
                 st.markdown("**Verbas Rescisórias a Pagar:**")
-                st.markdown(f"&nbsp;&nbsp;&nbsp;↳ Multa Art. 479 (50%): R$ {resultados['multa_479']:.2f}".replace('.', ','))
-                st.markdown(f"&nbsp;&nbsp;&nbsp;↳ Multa 40% FGTS (Est.): R$ {resultados['multa_fgts_hoje']:.2f}".replace('.', ','))
-                st.markdown(f"&nbsp;&nbsp;&nbsp;↳ Saldo Salário ({dt_proj_desligamento.day} dias): R$ {resultados['salario_saldo_hoje']:.2f}".replace('.', ','))
+                st.markdown(f"&nbsp;&nbsp;&nbsp;↳ Multa Art. 479 (50%): R$ {formatar_moeda(resultados['multa_479'])}")
+                st.markdown(f"&nbsp;&nbsp;&nbsp;↳ Multa 40% FGTS (Est.): R$ {formatar_moeda(resultados['multa_fgts_hoje'])}")
+                st.markdown(f"&nbsp;&nbsp;&nbsp;↳ Saldo Salário ({dt_proj_desligamento.day} dias): R$ {formatar_moeda(resultados['salario_saldo_hoje'])}")
                 
                 if resultados['avos_hoje'] > 0:
-                    st.markdown(f"&nbsp;&nbsp;&nbsp;↳ Férias ({resultados['avos_hoje']}/12): R$ {resultados['ferias_hoje']:.2f}".replace('.', ','))
-                    st.markdown(f"&nbsp;&nbsp;&nbsp;↳ 1/3 Férias: R$ {resultados['terco_hoje']:.2f}".replace('.', ','))
-                    st.markdown(f"&nbsp;&nbsp;&nbsp;↳ 13º Salário ({resultados['avos_hoje']}/12): R$ {resultados['decimo_hoje']:.2f}".replace('.', ','))
+                    st.markdown(f"&nbsp;&nbsp;&nbsp;↳ Férias ({resultados['avos_hoje']}/12): R$ {formatar_moeda(resultados['ferias_hoje'])}")
+                    st.markdown(f"&nbsp;&nbsp;&nbsp;↳ 1/3 Férias: R$ {formatar_moeda(resultados['terco_hoje'])}")
+                    st.markdown(f"&nbsp;&nbsp;&nbsp;↳ 13º Salário ({resultados['avos_hoje']}/12): R$ {formatar_moeda(resultados['decimo_hoje'])}")
                 else:
                     st.markdown(f"&nbsp;&nbsp;&nbsp;↳ Férias e 13º: R$ 0,00 *(Não atingiu 15 dias)*")
                 
                 st.markdown("**Custo de Benefícios Consumidos (Trabalhados):**")
-                st.markdown(f"&nbsp;&nbsp;&nbsp;↳ VT Utilizado: R$ {resultados['vt_gasto_hoje']:.2f}".replace('.', ','))
-                st.markdown(f"&nbsp;&nbsp;&nbsp;↳ VA Utilizado: R$ {resultados['va_gasto_hoje']:.2f}".replace('.', ','))
-                st.markdown(f"&nbsp;&nbsp;&nbsp;↳ VR Utilizado: R$ {resultados['vr_gasto_hoje']:.2f}".replace('.', ','))
+                st.markdown(f"&nbsp;&nbsp;&nbsp;↳ VT Utilizado: R$ {formatar_moeda(resultados['vt_gasto_hoje'])}")
+                st.markdown(f"&nbsp;&nbsp;&nbsp;↳ VA Utilizado: R$ {formatar_moeda(resultados['va_gasto_hoje'])}")
+                st.markdown(f"&nbsp;&nbsp;&nbsp;↳ VR Utilizado: R$ {formatar_moeda(resultados['vr_gasto_hoje'])}")
                 
-                custo_total_a = resultados['multa_479'] + resultados['multa_fgts_hoje'] + resultados['salario_saldo_hoje'] + resultados['ferias_hoje'] + resultados['terco_hoje'] + resultados['decimo_hoje'] + resultados['vt_gasto_hoje'] + resultados['va_gasto_hoje'] + resultados['vr_gasto_hoje']
-                st.markdown(f"### Custo Total Histórico + Rescisão: R$ {custo_total_a:.2f}".replace('.', ','))
+                custo_total_a = (
+                    resultados['multa_479'] + resultados['multa_fgts_hoje'] + 
+                    resultados['salario_saldo_hoje'] + resultados['ferias_hoje'] + 
+                    resultados['terco_hoje'] + resultados['decimo_hoje'] + 
+                    resultados['vt_gasto_hoje'] + resultados['va_gasto_hoje'] + 
+                    resultados['vr_gasto_hoje']
+                )
+                st.markdown(f"### Custo Total Histórico + Rescisão: R$ {formatar_moeda(custo_total_a)}")
 
             with c_manter:
                 if resultados["dias_restantes"] > 0:
@@ -1172,36 +1416,35 @@ elif menu == "⚖️ Simulador de Desligamento":
                     st.markdown(f"- **Multa Art. 479 (50%):** R$ 0,00 (ISENTO)")
                     
                     st.markdown("**1. Rescisão Futura:**")
-                    st.markdown(f"&nbsp;&nbsp;&nbsp;↳ Férias ({resultados['avos_proj']}/12): R$ {resultados['ferias_proj']:.2f}".replace('.', ','))
-                    st.markdown(f"&nbsp;&nbsp;&nbsp;↳ 1/3 Férias: R$ {resultados['terco_proj']:.2f}".replace('.', ','))
-                    st.markdown(f"&nbsp;&nbsp;&nbsp;↳ 13º Salário ({resultados['avos_proj']}/12): R$ {resultados['decimo_proj']:.2f}".replace('.', ','))
-                    st.markdown(f"&nbsp;&nbsp;&nbsp;↳ Saldo Salário mês seguinte ({resultados['dias_rescisao_futura']} dias): R$ {resultados['salario_rescisao_futura']:.2f}".replace('.', ','))
+                    st.markdown(f"&nbsp;&nbsp;&nbsp;↳ Férias ({resultados['avos_proj']}/12): R$ {formatar_moeda(resultados['ferias_proj'])}")
+                    st.markdown(f"&nbsp;&nbsp;&nbsp;↳ 1/3 Férias: R$ {formatar_moeda(resultados['terco_proj'])}")
+                    st.markdown(f"&nbsp;&nbsp;&nbsp;↳ 13º Salário ({resultados['avos_proj']}/12): R$ {formatar_moeda(resultados['decimo_proj'])}")
+                    st.markdown(f"&nbsp;&nbsp;&nbsp;↳ Saldo Salário mês seguinte ({resultados['dias_rescisao_futura']} dias): R$ {formatar_moeda(resultados['salario_rescisao_futura'])}")
                     
                     subtotal_rescisao = resultados['ferias_proj'] + resultados['terco_proj'] + resultados['decimo_proj'] + resultados['salario_rescisao_futura']
-                    st.markdown(f"**&nbsp;&nbsp;&nbsp;= Total Rescisão Futura: R$ {subtotal_rescisao:.2f}**".replace('.', ','))
+                    st.markdown(f"**&nbsp;&nbsp;&nbsp;= Total Rescisão Futura: R$ {formatar_moeda(subtotal_rescisao)}**")
                     
                     st.markdown("**2. Fluxo de Folha Normal (Até 5º Dia Útil):**")
-                    st.markdown(f"&nbsp;&nbsp;&nbsp;↳ Salário do mês atual: R$ {resultados['salario_folha_mensal']:.2f}".replace('.', ','))
+                    st.markdown(f"&nbsp;&nbsp;&nbsp;↳ Salário do mês atual: R$ {formatar_moeda(resultados['salario_folha_mensal'])}")
                     
                     st.markdown("**3. Custo de VA/VR (Apenas mês seguinte):**")
                     if resultados['dias_rescisao_futura'] > 0:
-                        st.markdown(f"&nbsp;&nbsp;&nbsp;↳ Vale Alimentação ({resultados['dias_rescisao_futura']} dias): R$ {resultados['va_projetado']:.2f}".replace('.', ','))
-                        st.markdown(f"&nbsp;&nbsp;&nbsp;↳ Vale Refeição ({resultados['dias_rescisao_futura']} dias): R$ {resultados['vr_projetado']:.2f}".replace('.', ','))
+                        st.markdown(f"&nbsp;&nbsp;&nbsp;↳ Vale Alimentação ({resultados['dias_rescisao_futura']} dias): R$ {formatar_moeda(resultados['va_projetado'])}")
+                        st.markdown(f"&nbsp;&nbsp;&nbsp;↳ Vale Refeição ({resultados['dias_rescisao_futura']} dias): R$ {formatar_moeda(resultados['vr_projetado'])}")
                     else:
                         st.markdown("&nbsp;&nbsp;&nbsp;↳ *Sem novos desembolsos (término ocorre no mês atual)*")
                     
                     custo_total_b = subtotal_rescisao + resultados['salario_folha_mensal'] + resultados['va_projetado'] + resultados['vr_projetado']
-                    st.markdown(f"### Desembolso Adicional Total: R$ {custo_total_b:.2f}".replace('.', ','))
+                    st.markdown(f"### Desembolso Adicional Total: R$ {formatar_moeda(custo_total_b)}")
                 else:
                     st.info("Colaborador fora do período de experiência.")
             
             # --- NOVO BLOCO: BALANÇO FINANCEIRO ---
             if resultados["dias_restantes"] > 0:
-                st.markdown("<br>", unsafe_allow_html=True) # Dá um pequeno espaço
+                st.markdown("<br>", unsafe_allow_html=True)
                 diferenca = custo_total_b - custo_total_a
                 
-                # Exibe a caixa de alerta com a diferença e a nota
-                st.info(f"**💡 Balanço Financeiro (Custo Total B - Custo Total A):** A diferença de desembolso entre os dois cenários é de **R$ {diferenca:.2f}**\n\n*Nota: O Cenário B não leva em consideração o valor gerado pela produção do funcionário no período em que ele permanecer com o contrato ativo*".replace('.', ','))
+                st.info(f"**💡 Balanço Financeiro (Custo Total B - Custo Total A):** A diferença de desembolso entre os dois cenários é de **R$ {formatar_moeda(diferenca)}**\n\n*Nota: O Cenário B não leva em consideração o valor gerado pela produção do funcionário no período em que ele permanecer com o contrato ativo*")
             # --------------------------------------
 
             st.markdown("---")

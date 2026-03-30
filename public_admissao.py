@@ -40,7 +40,12 @@ if not ZAPSIGN_TOKEN:
         ZAPSIGN_TOKEN = st.secrets.get("ZAPSIGN_TOKEN", "")
     except Exception:
         pass
-DATA_INICIO_PADRAO_STR = "23/03/2026"
+DATA_INICIO_PADRAO_STR = os.getenv("DATA_INICIO_PADRAO", "")
+if not DATA_INICIO_PADRAO_STR:
+    try:
+        DATA_INICIO_PADRAO_STR = st.secrets.get("DATA_INICIO_PADRAO", "23/03/2026")
+    except Exception:
+        DATA_INICIO_PADRAO_STR = "23/03/2026"
 
 ID_PASTA_RAIZ = "1_w4HGrBnylar-vkiQTDT6ozW8KiGITZs"
 ID_PLANILHA = "1-VH1zGyTeEfJnvBhnq6ZlkyGF-G--FKXTwGHfrCvfRE"
@@ -109,8 +114,26 @@ def conectar_google():
             if not os.path.exists(client_secret_json):
                  st.error("Erro: client_secret.json não encontrado para reautenticação manual.")
                  st.stop()
-            flow = InstalledAppFlow.from_client_secrets_file(client_secret_json, scopes)
-            creds = flow.run_local_server(port=0)
+            
+            try:
+                flow = InstalledAppFlow.from_client_secrets_file(client_secret_json, scopes)
+                # run_local_server tenta abrir o navegador, o que falha em ambientes de nuvem (headless)
+                creds = flow.run_local_server(port=0)
+            except Exception as e:
+                st.error("🚨 **Erro de Autenticação Google (Ambiente de Nuvem)**")
+                st.markdown(f"""
+                O aplicativo tentou reautenticar sua conta do Google, mas falhou porque está rodando em um servidor (Streamlit Cloud) que não possui navegador.
+                
+                **Como resolver:**
+                1. No seu computador local, execute o script: `python refresh_google_token.py`
+                2. Siga os passos no navegador local para autorizar o acesso.
+                3. Copie o JSON do novo token que aparecerá no seu terminal.
+                4. No painel do Streamlit Cloud, vá em **Settings > Secrets**.
+                5. Cole o conteúdo no campo `GOOGLE_TOKEN_JSON`.
+                
+                *Erro técnico: {e}*
+                """)
+                st.stop()
             
         with open(token_pickle, 'w') as token:
             token.write(creds.to_json())
