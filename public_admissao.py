@@ -148,7 +148,7 @@ def processar_documentos_ia(arquivos_upload):
     if not API_KEY_GEMINI:
         raise ValueError("Chave de API do Gemini não configurada. Defina GEMINI_API_KEY nas variáveis de ambiente ou no arquivo .streamlit/secrets.toml.")
     genai.configure(api_key=API_KEY_GEMINI)
-    modelo = genai.GenerativeModel('gemini-2.5-flash', generation_config={"response_mime_type": "application/json"})
+    modelo = genai.GenerativeModel('gemini-1.5-flash', generation_config={"response_mime_type": "application/json"})
     arquivos_ia = []
     status_bar = st.progress(0, text="Enviando arquivos para a IA...")
     for i, arq in enumerate(arquivos_upload):
@@ -158,20 +158,26 @@ def processar_documentos_ia(arquivos_upload):
         arquivos_ia.append(arquivo_up); os.remove(f"temp_{arq.name}")
         status_bar.progress((i + 1) / len(arquivos_upload), text=f"Lendo: {arq.name}")
 
-    prompt = """Você é um sistema automatizado de RH. Sua única função é extrair dados dos documentos fornecidos e preencher o template JSON abaixo.
-Os documentos podem incluir CNH, RG, CRNM de estrangeiros CTPS, Comprovante de Endereço, Título de Eleitor, Certificado de Reservista e Certidões (Nascimento/Casamento).
-REGRAS:
-1. "Nome Completo", "CPF", "RG", "Data de Nascimento": CNH, RG ou CRNM.
-2. "Nome da Mae" e "Nome do Pai": CNH, RG, CRNM ou Certidão.
-3. Endereço: Comprovante de residência. Ignore o endereço da empresa emissora (ex: Sabesp) e extraia O ENDEREÇO DO CONSUMIDOR. Tente desmembrar em Logradouro, Número, Bairro, Cidade e CEP. Se houver mais de um comprovante, escolha o mais recente.
-4. "CTPS Numero": Se CTPS Digital, use o CPF. Deixe Série e UF vazios.
-5. "Orgao Emissor RG" e "UF RG": Separe as letras do Estado (ex: SSP e SP). Para estrangeiros, deixe vazio.
-6. "Titulo de Eleitor", "Zona", "Secao": Título de Eleitor.
-7. "Reservista": Certificado militar.
-8. "Estado Civil": Siga a regra documental rigorosamente:
-  - Se o documento apresentado for uma "Certidão de Nascimento" (e não houver averbação de casamento), preencha "SOLTEIRO(A)".
-  - Se o documento for uma "Certidão de Casamento", preencha "CASADO(A)"
-9. "Validacao Vacina Antitetanica": Verifique a Carteira de Vacinação. Se ela contiver de forma clara o nome do titular (condizente com o Nome Completo extraído dos outros documentos) E nela constar o registro claro da vacina "Antitetânica" (ou Dupla Adulto / dT), preencha estritamente com a palavra "OK". Caso contrário, descreva o problema, exemplo: "Nome do titular não identificado na carteira" ou "Falta registro da vacina Antitetânica".
+    prompt = """Você é um sistema automatizado de RH de alta precisão. Sua única função é extrair dados dos documentos fornecidos para admissão e preencher o template JSON abaixo.
+    
+    DOCUMENTOS FORNECIDOS:
+    Podem incluir RG, CNH, CPF, Comprovante de Endereço (luz, água, fone, gás, extratos bancários), Título de Eleitor, Reservista, Certidões (Nascimento/Casamento) e Carteira de Vacinação.
+
+    REGRAS CRÍTICAS DE EXTRAÇÃO:
+    1. **Identificação do Candidato**: Use RG/CNH para extrair "Nome Completo", "CPF", "RG" e "Data de Nascimento".
+    2. **ENDEREÇO (Regra de Ouro)**: 
+       - Localize o Comprovante de Residência.
+       - **IGNORE o endereço da empresa emissora** (ex: ignore o endereço da sede da Sabesp, Enel ou do Banco).
+       - **BUSQUE O ENDEREÇO DO CONSUMIDOR/TITULAR**, que deve ser o mesmo nome do candidato.
+       - Extraia estruturado em: Logradouro (Rua/Av), Número, Complemento, Bairro, Cidade, Estado e CEP (apenas dígitos).
+    3. **Estado Civil**: Siga rigorosamente a prova documental:
+       - Certidão de Nascimento (sem averbação de casamento) = SOLTEIRO(A).
+       - Certidão de Casamento = CASADO(A).
+    4. **Vacina Antitetânica (Audit de Saúde)**: Procure na Carteira de Vacinação por "Antitetânica", "dT" ou "Dupla Adulto".
+       - Verifique se o nome na carteira é do candidato. 
+       - Se identificada e o nome conferir, responda estritamente "OK". Caso contrário, descreva o problema.
+    5. **CTPS**: Se for CTPS Digital, use o CPF no campo "CTPS Numero".
+    6. **Outros**: Para estrangeiros (CRNM), extraia os dados equivalentes ao RG.
 
     JSON ESPERADO:
     {
