@@ -17,6 +17,13 @@ import zipfile
 from PyPDF2 import PdfReader, PdfWriter
 from db_client import save_admission_record, get_funcionarios_financeiro, _to_decimal, save_payroll_record
 from decimal import Decimal, ROUND_HALF_UP
+from modules.rescisao import calcular_cenarios_desligamento as calcular_cenarios_desligamento_novo
+from modules.formatters import formatar_moeda as formatar_moeda_novo
+from modules.folha_pagamento import calcular_liquido_folha as calcular_liquido_folha_novo
+from modules.formatters import formatar_moeda
+
+# Alias para compatibilidade com código existente
+calcular_cenarios_desligamento = calcular_cenarios_desligamento_novo
 
 def calcular_dias_uteis_proporcionais(adm_str, fech_date):
     """Calcula dias úteis (Seg-Sex) desde a admissão até o fechamento se no mesmo mês."""
@@ -63,12 +70,7 @@ MODELOS_ADMISSAO = {
     "06. Acordo Prorrogação": "1XuOQ1Z9MIeotWrbYnsH7XoSCzc24_FJ6MtYt9f3L0eA"
 }
 
-FAIXAS_INSS = [
-    (Decimal("1518.00"), Decimal("0.075")), 
-    (Decimal("2793.88"), Decimal("0.09")), 
-    (Decimal("4190.83"), Decimal("0.12")), 
-    (Decimal("8157.41"), Decimal("0.14"))
-]
+# FAIXAS_INSS movidas para modules/constants.py - importadas dinamicamente
 
 
 
@@ -297,10 +299,11 @@ def conectar_google():
     return build('drive', 'v3', credentials=creds), build('docs', 'v1', credentials=creds), gspread.authorize(creds)
 
 def formatar_moeda(valor):
-    if not valor or valor == 0 or valor == "0,00": return "0,00"
-    if isinstance(valor, str):
-        valor = _to_decimal(valor)
-    return f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    """
+    Wrapper para compatibilidade com código existente.
+    A implementação real está em modules/formatters.py
+    """
+    return formatar_moeda_novo(valor)
 
 # ==========================================
 # 3. MÓDULO ADMISSÃO
@@ -449,17 +452,8 @@ def exportar_pdfs_da_pasta(folder_id: str):
 # 4. MÓDULO FOLHA
 # ==========================================
 
-def calcular_inss(bruto):
-    if not isinstance(bruto, Decimal): bruto = _to_decimal(bruto)
-    desconto = Decimal("0.00")
-    faixa_ant = Decimal("0.00")
-    for teto, aliq in FAIXAS_INSS:
-        if bruto > faixa_ant:
-            base = min(bruto, teto) - faixa_ant
-            desconto += base * aliq
-            faixa_ant = teto
-        else: break
-    return desconto.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+# calcular_inss() refatorado e movido para modules/folha_pagamento.py
+# Use: from modules.folha_pagamento import calcular_inss
 
 def salvar_log_folha_sheets(lista_dados):
     """Salva um resumo do processamento de folha em uma aba do Google Sheets para conferência."""
@@ -511,43 +505,8 @@ def salvar_log_folha_sheets(lista_dados):
         st.error(f"Erro ao salvar log no Sheets: {e}")
         return False
 
-def calcular_irrf_2026(bruto, desconto_inss, dependentes=0):
-    if not isinstance(bruto, Decimal): bruto = _to_decimal(bruto)
-    if not isinstance(desconto_inss, Decimal): desconto_inss = _to_decimal(desconto_inss)
-    
-    deducao_dep = Decimal("189.59") * Decimal(str(dependentes))
-    base_legal = bruto - desconto_inss - deducao_dep
-    base_simplificada = bruto - Decimal("607.20")
-    base_calculo = min(base_legal, base_simplificada)
-    
-    # Tabela Tradicional 2026 (Baseada no PDF)
-    if base_calculo <= Decimal("2428.80"): 
-        imposto_bruto = Decimal("0.00")
-        faixa_str = "ISENTO"
-    elif base_calculo <= Decimal("2826.65"): 
-        imposto_bruto = (base_calculo * Decimal("0.075")) - Decimal("182.16")
-        faixa_str = "7.5%"
-    elif base_calculo <= Decimal("3751.05"): 
-        imposto_bruto = (base_calculo * Decimal("0.150")) - Decimal("394.16")
-        faixa_str = "15.0%"
-    elif base_calculo <= Decimal("4664.68"): 
-        imposto_bruto = (base_calculo * Decimal("0.225")) - Decimal("675.49")
-        faixa_str = "22.5%"
-    else: 
-        imposto_bruto = (base_calculo * Decimal("0.275")) - Decimal("908.73")
-        faixa_str = "27.5%"
-    
-    # Regra de Redução Adicional (Nova Tabela 2026)
-    # Redução para quem ganha até R$ 5.000 (Zera o imposto)
-    if bruto <= Decimal("5000.00"): 
-        return Decimal("0.00"), "ISENTO (Redutor 2026)"
-    # Redução Gradual para quem ganha até R$ 7.350
-    elif bruto <= Decimal("7350.00"):
-        reducao = Decimal("978.62") - (Decimal("0.133145") * bruto)
-        imposto_final = max(Decimal("0.00"), imposto_bruto - reducao)
-        return imposto_final.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), (faixa_str if imposto_final > 0 else "ISENTO")
-    
-    return imposto_bruto.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), faixa_str
+# calcular_irrf_2026() refatorado e movido para modules/folha_pagamento.py
+# Use: from modules.folha_pagamento import calcular_irrf
 
 def calcular_adiantamento_prop(sal_base, adm_str, fecham_str):
     if not isinstance(sal_base, Decimal): sal_base = _to_decimal(sal_base)
@@ -621,9 +580,15 @@ def gerar_holerite_dinamico(dados):
         base_impostos = bruto - val_faltas - val_dsr_perdido - val_atrasos
         if base_impostos < 0: base_impostos = Decimal("0.00")
         
-        # 4. Cálculo dos Impostos sobre a Base Real
-        inss = calcular_inss(base_impostos)
-        irrf, faixa_irrf = calcular_irrf_2026(base_impostos, inss, dependentes=dados.get('dependentes', 0))
+        # 4. Cálculo dos Impostos sobre a Base Real (usando novo motor centralizado)
+        resultado_folha = calcular_liquido_folha_novo(
+            salario_bruto=float(base_impostos),
+            dependentes=int(dados.get('dependentes', 0)),
+            outros_descontos=0.0  # Descontos adicionais (VT, VA, etc) são calculados após
+        )
+        inss = Decimal(str(resultado_folha['inss']))
+        irrf = Decimal(str(resultado_folha['irrf']))
+        faixa_irrf = f"{resultado_folha['aliquota_efetiva_irrf']:.2f}%" if resultado_folha['irrf'] > 0 else "ISENTO"
         
         # 5. Novo Motor de Vale Transporte
         desc_vt_flag = dados.get('Descontar VT', False)
@@ -851,119 +816,15 @@ def buscar_funcionarios():
     return final_list
 
 # ==========================================
-# NOVO MÓDULO: SIMULADOR DE DESLIGAMENTO
+# MÓDULO: SIMULADOR DE DESLIGAMENTO (REFATORADO)
 # ==========================================
-
-def calcular_cenarios_desligamento(func_dados, data_desligamento):
-    try: dt_adm = datetime.strptime(func_dados['admissao'], '%d/%m/%Y').date()
-    except Exception as e: return None
-    
-    salario = _to_decimal(func_dados.get('salario', '0'))
-    va_mensal = _to_decimal(func_dados.get('Valor VA', '0'))
-    vr_mensal = _to_decimal(func_dados.get('vr_mensal', '0'))
-    vt_diario = _to_decimal(func_dados.get('VT Diário', '0'))
-        
-    valor_dia = salario / Decimal("30")
-    
-    dt_fim_45 = dt_adm + timedelta(days=44)
-    dt_fim_90 = dt_adm + timedelta(days=89)
-    dias_trabalhados_hoje = (data_desligamento - dt_adm).days + 1
-    
-    if dias_trabalhados_hoje <= 45:
-        fase = "1º Período de Experiência (45 dias)"
-        dt_alvo = dt_fim_45
-        dias_restantes = (dt_fim_45 - data_desligamento).days
-        total_dias_projetados = 45
-    elif dias_trabalhados_hoje <= 90:
-        fase = "2º Período de Experiência (90 dias)"
-        dt_alvo = dt_fim_90
-        dias_restantes = (dt_fim_90 - data_desligamento).days
-        total_dias_projetados = 90
-    else:
-        fase = "Contrato por Prazo Indeterminado"
-        dt_alvo = None; dias_restantes = 0; total_dias_projetados = dias_trabalhados_hoje
-
-    multa_479 = ((Decimal(str(dias_restantes)) * valor_dia) / Decimal("2")) if dias_restantes > 0 else Decimal("0.00")
-    
-    # 1. AVOS E FGTS (CENÁRIO A)
-    meses_cheios_hoje = dias_trabalhados_hoje // 30
-    dias_sobra_hoje = dias_trabalhados_hoje % 30
-    avos_hoje = meses_cheios_hoje + (1 if dias_sobra_hoje >= 15 else 0)
-    
-    ferias_hoje = (salario / Decimal("12")) * Decimal(str(avos_hoje))
-    terco_hoje = ferias_hoje / Decimal("3")
-    decimo_hoje = (salario / Decimal("12")) * Decimal(str(avos_hoje))
-    
-    # Estimativa de Multa FGTS 40% (Saldo Base = Salários pagos + 13º proporcional)
-    base_fgts_acumulada = (valor_dia * Decimal(str(dias_trabalhados_hoje))) + decimo_hoje
-    saldo_fgts_est = base_fgts_acumulada * Decimal("0.08")
-    multa_fgts_hoje = saldo_fgts_est * Decimal("0.40")
-    
-    # Custo de Benefícios Consumidos (Cenário A)
-    dias_uteis_trabalhados = Decimal(str(int(dias_trabalhados_hoje * 0.73)))
-    vt_gasto_hoje = dias_uteis_trabalhados * vt_diario
-    va_gasto_hoje = (va_mensal / Decimal("30")) * Decimal(str(dias_trabalhados_hoje))
-    vr_gasto_hoje = (vr_mensal / Decimal("30")) * Decimal(str(dias_trabalhados_hoje))
-
-    # 2. AVOS PROJETADOS (CENÁRIO B)
-    meses_cheios_proj = total_dias_projetados // 30
-    dias_sobra_proj = total_dias_projetados % 30
-    avos_proj = meses_cheios_proj + (1 if dias_sobra_proj >= 15 else 0)
-    
-    ferias_proj = (salario / Decimal("12")) * Decimal(str(avos_proj))
-    terco_proj = ferias_proj / Decimal("3")
-    decimo_proj = (salario / Decimal("12")) * Decimal(str(avos_proj))
-    
-    # 3. FATIAMENTO DE CAIXA (CENÁRIO B)
-    salario_folha_mensal = Decimal("0.00")
-    salario_rescisao_futura = Decimal("0.00")
-    dias_rescisao_futura = 0
-    
-    if dias_restantes > 0:
-        import calendar
-        ultimo_dia_mes_atual = calendar.monthrange(data_desligamento.year, data_desligamento.month)[1]
-        dias_ate_fim_mes = (date(data_desligamento.year, data_desligamento.month, ultimo_dia_mes_atual) - data_desligamento).days
-        
-        if dt_alvo.month == data_desligamento.month:
-            salario_folha_mensal = Decimal(str(dias_restantes)) * valor_dia
-            dias_rescisao_futura = 0
-        else:
-            salario_folha_mensal = Decimal(str(dias_ate_fim_mes)) * valor_dia
-            dias_rescisao_futura = dias_restantes - dias_ate_fim_mes
-            salario_rescisao_futura = Decimal(str(dias_rescisao_futura)) * valor_dia
-
-    # VA/VR Futuros (Apenas para os dias do mês de rescisão)
-    va_projetado = (va_mensal / Decimal("30")) * Decimal(str(dias_rescisao_futura))
-    vr_projetado = (vr_mensal / Decimal("30")) * Decimal(str(dias_rescisao_futura))
-    
-    return {
-        "dias_trabalhados_hoje": dias_trabalhados_hoje, "fase": fase,
-        "dt_alvo": dt_alvo.strftime('%d/%m/%Y') if dt_alvo else "N/A",
-        "dias_restantes": dias_restantes, "multa_479": multa_479.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
-        
-        "avos_hoje": avos_hoje, 
-        "ferias_hoje": ferias_hoje.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), 
-        "terco_hoje": terco_hoje.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), 
-        "decimo_hoje": decimo_hoje.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
-        "multa_fgts_hoje": multa_fgts_hoje.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
-        "vt_gasto_hoje": vt_gasto_hoje.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), 
-        "va_gasto_hoje": va_gasto_hoje.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), 
-        "vr_gasto_hoje": vr_gasto_hoje.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
-        
-        "avos_proj": avos_proj, 
-        "ferias_proj": ferias_proj.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), 
-        "terco_proj": terco_proj.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), 
-        "decimo_proj": decimo_proj.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
-        
-        "salario_folha_mensal": salario_folha_mensal.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
-        "salario_rescisao_futura": salario_rescisao_futura.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), 
-        "dias_rescisao_futura": dias_rescisao_futura,
-        "va_projetado": va_projetado.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), 
-        "vr_projetado": vr_projetado.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
-        "va_mensal_cheio": va_mensal, "vr_mensal_cheio": vr_mensal,
-        
-        "salario_saldo_hoje": (Decimal(str(data_desligamento.day)) * valor_dia).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    }
+# Função extraída para modules/rescisao.py com:
+# - Type hints (tipagem estática)
+# - Docstrings com referências legais
+# - Debug logs para auditoria de cálculos
+#
+# O código mantém compatibilidade com a interface anterior.
+# Para usar a função refatorada: calcular_cenarios_desligamento_novo()
 
 # ==========================================
 # MÓDULO: ORGANIZADOR DE SCANS
@@ -982,21 +843,26 @@ def classificar_e_splitar_pdf(pdf_file):
         arquivo_gemini = genai.get_file(arquivo_gemini.name)
 
     prompt = """
-    Analise este PDF de admissão e identifique todos os documentos presentes.
+    Analise este PDF de admissão e identifique TODOS os documentos presentes.
     
     REGRAS OBRIGATÓRIAS:
     1. Cada página do PDF pertence a APENAS UM documento. NUNCA coloque o mesmo número de página em dois documentos diferentes.
     2. SEPARE rigorosamente Certificados de Avaliações/Testes. O "Certificado NR 35" é um documento, e o "Teste/Avaliação NR 35" é outro documento totalmente diferente. Não agrupe.
     3. Retorne uma matriz exata de páginas (ex: [4, 5]).
+    4. Identifique o tipo de documento SEPARADO do conteúdo/treinamento. NR01 é "Ordem de Serviço", APR é "Análise Preliminar de Riscos".
     
     Para cada documento encontrado, retorne:
-    1. O tipo de documento (ex: NR01 , NR06 , NR12 , NR18 ,NR35, ASO)
-    2. O nome do funcionário.
-    3. A lista de páginas.
+    1. "treinamento": O tipo/nome do documento (ex: "NR01" para Ordem de Serviço, "APR" para Análise Preliminar de Riscos, "NR06", "NR12", "NR18", "NR35")
+    2. "tipo": Se é "Certificado" ou "Avaliação"
+    3. "funcionario": O nome completo do funcionário
+    4. "paginas": A lista exata de números de páginas
     
     Retorne no formato JSON:
     [
-      {""tipo": "TIPO DO DOCUMENTO", "funcionario": "NOME DO FUNCIONARIO", "paginas": [1, 2]}
+      {"treinamento": "NR35", "tipo": "Certificado", "funcionario": "NOME DO FUNCIONARIO", "paginas": [1, 2]},
+      {"treinamento": "NR35", "tipo": "Avaliação", "funcionario": "NOME DO FUNCIONARIO", "paginas": [3]},
+      {"treinamento": "APR", "tipo": "Análise Preliminar de Riscos", "funcionario": "OUTRO FUNCIONARIO", "paginas": [4, 5]},
+      {"treinamento": "NR01", "tipo": "Ordem de Serviço", "funcionario": "OUTRO FUNCIONARIO", "paginas": [6]}
     ]
     """
     response = model.generate_content([prompt, arquivo_gemini], request_options={"timeout": 600})
@@ -1024,9 +890,10 @@ def classificar_e_splitar_pdf(pdf_file):
                 output_pdf = io.BytesIO()
                 writer.write(output_pdf)
                 
+                treinamento = doc.get("treinamento", "DESCONHECIDO").replace(" ", "_").replace("/", "-")
+                tipo = doc.get("tipo", "TIPO").replace(" ", "_").replace("/", "-")
                 nome_func = doc.get("funcionario", "Desconhecido").replace(" ", "_").replace("/", "-")
-                tipo_doc = doc.get("tipo", "Documento").replace(" ", "_").replace("/", "-")
-                nome_arquivo = f"{nome_func}_{tipo_doc}.pdf"
+                nome_arquivo = f"{treinamento}_{tipo}_{nome_func}.pdf"
                 
                 zip_file.writestr(nome_arquivo, output_pdf.getvalue())
                 
