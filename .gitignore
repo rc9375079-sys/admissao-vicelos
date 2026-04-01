@@ -1,23 +1,34 @@
-# Byte-compiled / optimized / DLL files
+# Credenciais e Tokens (NUNCA COMMITAR)
+credentials.json
+client_secret.json
+token.json
+
+# Arquivos de documentação temporária
+*.rtf
+*.pdf
+
+# Cache Python
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
+.Python
 
-# Virtual environments
+# Ambientes virtuais
 venv/
 env/
 ENV/
-env.bak/
-venv.bak/
 
-# Streamlit secrets and credentials
-.streamlit/secrets.toml
-client_secret.json
-token.json
-credentials.json
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
 
-# Logs and temporary files
-*.log
+# Sistema operacional
 .DS_Store
-/tmp/
-test_*.pdf
+Thumbs.db
+
+# Variáveis de ambiente
+.env
+.env.local
